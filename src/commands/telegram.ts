@@ -397,10 +397,14 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
   return (await res.json()) as T;
 }
 
+// Telegram's per-message character limit. editMessageText cannot exceed it and has
+// no multi-message form, so anything longer has to be sent, not edited.
+const TELEGRAM_MAX_LEN = 4096;
+
 async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
   const html = markdownToTelegramHtml(normalized);
-  const MAX_LEN = 4096;
+  const MAX_LEN = TELEGRAM_MAX_LEN;
   for (let i = 0; i < html.length; i += MAX_LEN) {
     try {
       await callApi(token, "sendMessage", {
@@ -1534,6 +1538,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           // the user already sees the correct content and a sendMessage would duplicate.
           const finalText = cleanedText || "(empty response)";
           const html = markdownToTelegramHtml(normalizeTelegramText(finalText));
+          // editMessageText carries a hard 4096-char cap and cannot span messages,
+          // so the .slice() below silently DROPS everything past 4096 — long answers
+          // arrive cut off mid-sentence. sendMessage() chunks correctly, so for
+          // oversized replies delete the preview and send the whole thing instead.
+          if (html.length > TELEGRAM_MAX_LEN || finalText.length > TELEGRAM_MAX_LEN) {
+            await callApi(config.token, "deleteMessage", {
+              chat_id: chatId, message_id: streamMsgId,
+            }).catch(() => {});
+            await sendMessage(config.token, chatId, finalText, threadId);
+          } else {
           await callApi(config.token, "editMessageText", {
             chat_id: chatId, message_id: streamMsgId,
             text: html.slice(0, 4096), parse_mode: "HTML",
@@ -1549,6 +1563,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
               return sendMessage(config.token, chatId, finalText, threadId);
             }
           }));
+          }
         }
       } else if (cleanedText) {
         await sendMessage(config.token, chatId, cleanedText, threadId);
