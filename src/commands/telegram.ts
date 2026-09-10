@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isThreadBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
 import { wrapUntrusted } from "../prompt-safety";
 import { isAllowed } from "../allowlist";
 import { extractErrorDetail } from "../messaging";
@@ -1146,8 +1146,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/kill") {
-    const killed = killActive();
-    await sendMessage(config.token, chatId, killed ? "Killed active agent." : "No active agent running.", threadId);
+    // Scoped to this topic — with threads running in parallel, an unscoped kill
+    // would take down work the user can't even see from here.
+    const killed = killActive(sessionKey);
+    await sendMessage(config.token, chatId, killed ? "Killed active agent in this topic." : "No active agent running in this topic.", threadId);
     return;
   }
 
@@ -1455,14 +1457,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const busy = isMainBusy();
+    // Per-topic: threads run in parallel (runner enqueues per threadId), so only a
+    // run in THIS thread should block. A busy topic must not gate a different one.
+    const busy = isThreadBusy(sessionKey);
     const verbose = verboseChats.has(chatId);
     const modelOverride = chatModels.get(chatId);
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
     if (busy) {
-      await sendMessage(config.token, chatId, "Claude is busy — try again in a moment, or use /fork for a quick parallel task.", threadId);
+      await sendMessage(config.token, chatId, "Claude is busy in this topic — try again in a moment, or use /fork for a quick parallel task.", threadId);
       return;
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
