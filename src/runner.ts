@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
+import { AsyncLocalStorage } from "async_hooks";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
@@ -253,6 +254,40 @@ const threadQueues = new Map<string, Promise<unknown>>();
 // Counter of concurrently-running main-queue sessions (per-thread queues run in parallel)
 let mainRunCount = 0;
 
+// Run bookkeeping is keyed the same way enqueue() picks a queue: by threadId when
+// there is one, otherwise the shared global queue. That keeps "busy" honest — it
+// answers "would MY next message have to wait?", not "is anything running anywhere?".
+const MAIN_RUN_KEY = "__main__";
+const runCounts = new Map<string, number>();
+
+/** Bookkeeping key for a run: its own thread, or the shared global queue. */
+function toRunKey(threadId?: string): string {
+  return threadId && threadId.length > 0 ? threadId : MAIN_RUN_KEY;
+}
+
+// Propagates the current run's key to the spawn helpers without threading an extra
+// parameter through every call site. Each execClaude runs in its own async context,
+// so concurrent thread runs never see each other's key.
+const runKeyStore = new AsyncLocalStorage<string>();
+
+function currentRunKey(): string {
+  return runKeyStore.getStore() ?? MAIN_RUN_KEY;
+}
+
+function incrementRunCount(key: string): void {
+  mainRunCount++;
+  runCounts.set(key, (runCounts.get(key) ?? 0) + 1);
+  persistRunCount();
+}
+
+function decrementRunCount(key: string): void {
+  mainRunCount--;
+  const remaining = (runCounts.get(key) ?? 1) - 1;
+  if (remaining > 0) runCounts.set(key, remaining);
+  else runCounts.delete(key);
+  persistRunCount();
+}
+
 /** Current number of concurrently-running main-queue sessions. */
 export function getMainRunCount(): number {
   return mainRunCount;
@@ -281,21 +316,47 @@ function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
 // Using a Set because per-thread queues run in parallel — multiple main
 // runs can be in-flight at the same time. Fork procs are excluded: they run
 // outside the main queue and must not be killed by /kill.
-const mainActiveProcs = new Set<ReturnType<typeof Bun.spawn>>();
+// Maps each tracked proc to the run key that spawned it, so /kill can target one
+// thread instead of every thread that happens to be running.
+const mainActiveProcs = new Map<ReturnType<typeof Bun.spawn>, string>();
 
-/** Kill all running main-queue claude subprocesses. Returns true if anything was killed. */
-export function killActive(): boolean {
-  if (mainActiveProcs.size === 0) return false;
-  for (const proc of mainActiveProcs) {
+function trackProc(proc: ReturnType<typeof Bun.spawn>): void {
+  mainActiveProcs.set(proc, currentRunKey());
+}
+
+/**
+ * Kill running main-queue claude subprocesses. With a threadId, kills only that
+ * thread's runs; without one, kills everything (the old global behaviour).
+ * Returns true if anything was killed.
+ */
+export function killActive(threadId?: string): boolean {
+  const targetKey = threadId === undefined ? null : toRunKey(threadId);
+  let killed = false;
+  for (const [proc, key] of [...mainActiveProcs]) {
+    if (targetKey !== null && key !== targetKey) continue;
     try { proc.kill(); } catch {}
+    mainActiveProcs.delete(proc);
+    killed = true;
   }
-  mainActiveProcs.clear();
-  return true;
+  return killed;
 }
 
 /** True while any main-queue agent is processing a task (excludes fork). */
 export function isMainBusy(): boolean {
   return mainRunCount > 0;
+}
+
+/**
+ * True while THIS thread already has a run in flight. Threads execute in parallel
+ * (see enqueue), so a run in thread A must not report thread B as busy.
+ */
+export function isThreadBusy(threadId?: string): boolean {
+  return (runCounts.get(toRunKey(threadId)) ?? 0) > 0;
+}
+
+/** Run keys with at least one in-flight run — useful for status output. */
+export function getBusyRunKeys(): string[] {
+  return [...runCounts.keys()];
 }
 
 function extractRateLimitMessage(stdout: string, stderr: string): string | null {
@@ -424,7 +485,7 @@ async function runClaudeOnce(
     ...(cwd ? { cwd } : {}),
   });
 
-  mainActiveProcs.add(proc);
+  trackProc(proc);
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
@@ -493,7 +554,7 @@ async function runClaudeStream(
     ...(cwd ? { cwd } : {}),
   });
 
-  mainActiveProcs.add(proc);
+  trackProc(proc);
   let sessionId: string | undefined;
   let resultText = "";
   let stderr = "";
@@ -644,7 +705,7 @@ async function runClaudeStreaming(
     env: buildChildEnv(baseEnv, model, api),
   });
 
-  mainActiveProcs.add(proc);
+  trackProc(proc);
   const stderrPromise = new Response(proc.stderr).text();
 
   let finalResult = "";
@@ -1030,8 +1091,8 @@ async function execClaude(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void
 ): Promise<RunResult> {
-  mainRunCount++;
-  persistRunCount();
+  const runKey = toRunKey(threadId);
+  incrementRunCount(runKey);
   try {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -1425,8 +1486,7 @@ async function execClaude(
 
   return result;
   } finally {
-    mainRunCount--;
-    persistRunCount();
+    decrementRunCount(runKey);
   }
 }
 
@@ -1441,7 +1501,11 @@ export async function run(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent), threadId);
+  return enqueue(
+    () => runKeyStore.run(toRunKey(threadId), () =>
+      execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent)),
+    threadId,
+  );
 }
 
 async function streamClaude(
