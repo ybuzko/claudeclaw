@@ -1207,9 +1207,12 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     const fmtReset = (iso: string | null) => {
       if (!iso) return "unknown";
-      return new Date(iso).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+      return new Date(iso).toLocaleString("en-US", {
+        timeZone: "America/Los_Angeles",
+        month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      }) + " PT";
     };
-    const pct = (n: number | null) => (n == null ? "?" : `${n}%`);
+    const pct = (n: number | null) => (n == null ? "?" : `${n}% used`);
     const lines = [
       "📊 Usage quota:",
       `• 5h session: ${pct(usage.fiveHourPercent)} (resets ${fmtReset(usage.fiveHourResetsAt)})`,
