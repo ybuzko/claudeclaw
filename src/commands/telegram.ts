@@ -464,10 +464,14 @@ async function sendDocumentToChat(
 const verboseChats = new Set<number>();
 
 // Model overrides per chat ID
-const chatModels = new Map<number, string>();
+const chatModels = new Map<string, string>();
+function modelKey(chatId: number, threadId?: number): string {
+  return threadId ? `${chatId}:${threadId}` : String(chatId);
+}
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
+const MODEL_FABLE = "claude-fable-5-1";
 
 /**
  * Build a streaming callback using editMessageText.
@@ -1171,41 +1175,75 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/model") {
-    const currentModel = chatModels.get(chatId);
+    const currentModel = chatModels.get(modelKey(chatId, threadId));
     const settings = getSettings();
     const defaultModel = settings.model || "default";
+    const optionsList = "\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modelfable - Fable 5.1\n• /modelid <id> - Any model ID (see /modelids)\n• /modeldefault - Use config default\n\nScope: this topic only.";
     if (!currentModel) {
-      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced (default)\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default`, threadId);
+      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)${optionsList}`, threadId);
     } else {
-      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel;
-      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default (${defaultModel})`, threadId);
+      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel === MODEL_FABLE ? "Fable 5.1" : currentModel;
+      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**${optionsList}`, threadId);
     }
     return;
   }
 
+  if (command === "/modelids") {
+    const settings = getSettings();
+    const lines = [
+      "📋 Model IDs:",
+      `• Haiku: \`${MODEL_HAIKU}\``,
+      `• Sonnet: \`${MODEL_SONNET}\``,
+      `• Opus: \`${MODEL_OPUS}\``,
+      `• Fable 5.1: \`${MODEL_FABLE}\``,
+      `• Config default: \`${settings.model || "(unset)"}\``,
+      "",
+      "Use /modelid <id> to switch to any of these (or another valid model ID) for this topic.",
+    ];
+    await sendMessage(config.token, chatId, lines.join("\n"), threadId);
+    return;
+  }
+
   if (command === "/modelhaiku") {
-    chatModels.set(chatId, MODEL_HAIKU);
-    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_HAIKU);
+    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelsonnet") {
-    chatModels.set(chatId, MODEL_SONNET);
-    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_SONNET);
+    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelopus") {
-    chatModels.set(chatId, MODEL_OPUS);
-    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_OPUS);
+    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses. (this topic only)", threadId);
+    return;
+  }
+
+  if (command === "/modelfable") {
+    chatModels.set(modelKey(chatId, threadId), MODEL_FABLE);
+    await sendMessage(config.token, chatId, "📖 Switched to Fable 5.1. (this topic only)", threadId);
+    return;
+  }
+
+  if (command === "/modelid") {
+    const modelId = text.replace(/^\/modelid(@\S+)?\s*/i, "").trim();
+    if (!modelId) {
+      await sendMessage(config.token, chatId, "Usage: /modelid <model-id>\n\nSee /modelids for known IDs.", threadId);
+      return;
+    }
+    chatModels.set(modelKey(chatId, threadId), modelId);
+    await sendMessage(config.token, chatId, `📊 Switched to \`${modelId}\`. (this topic only)`, threadId);
     return;
   }
 
   if (command === "/modeldefault") {
-    chatModels.delete(chatId);
+    chatModels.delete(modelKey(chatId, threadId));
     const settings = getSettings();
     const defaultModel = settings.model || "default";
-    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel}`, threadId);
+    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel} (this topic only)`, threadId);
     return;
   }
 
@@ -1467,7 +1505,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     // run in THIS thread should block. A busy topic must not gate a different one.
     const busy = isThreadBusy(sessionKey);
     const verbose = verboseChats.has(chatId);
-    const modelOverride = chatModels.get(chatId);
+    const modelOverride = chatModels.get(modelKey(chatId, threadId));
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
@@ -1726,6 +1764,9 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "modelhaiku", description: "⚡ Switch to Haiku (fastest)" },
       { command: "modelsonnet", description: "⚖️ Switch to Sonnet (balanced)" },
       { command: "modelopus", description: "🧠 Switch to Opus (most capable)" },
+      { command: "modelfable", description: "📖 Switch to Fable 5.1" },
+      { command: "modelid", description: "📊 Switch to any model ID" },
+      { command: "modelids", description: "📋 List known model IDs" },
       { command: "modeldefault", description: "🔄 Reset to config default model" },
       // Mode toggles
       { command: "mode", description: "🔐 Get or set Claude permission mode" },
@@ -1755,7 +1796,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
