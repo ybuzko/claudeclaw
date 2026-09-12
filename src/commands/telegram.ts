@@ -777,6 +777,11 @@ let botId: number | null = null;
 
 function groupTriggerReason(message: TelegramMessage): string | null {
   if (botId && message.reply_to_message?.from?.id === botId) return "reply_to_bot";
+
+  // listenChats must be checked before the text guard so photo-only messages still trigger
+  const { telegram } = getSettings();
+  if (telegram.listenChats?.includes(message.chat.id)) return "listen_chat";
+
   const { text, entities } = getMessageTextAndEntities(message);
   if (!text) return null;
   const lowerText = text.toLowerCase();
@@ -794,9 +799,6 @@ function groupTriggerReason(message: TelegramMessage): string | null {
       if (botUsername && value.toLowerCase().endsWith(`@${botUsername.toLowerCase()}`)) return "scoped_command_matches_bot";
     }
   }
-
-  const { telegram } = getSettings();
-  if (telegram.listenChats?.includes(message.chat.id)) return "listen_chat";
 
   return null;
 }
