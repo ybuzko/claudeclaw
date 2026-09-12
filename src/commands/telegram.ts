@@ -8,6 +8,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { findSessionJsonlPath } from "../sessionFiles";
 import { resolveSkillPrompt, listSkills } from "../skills";
@@ -379,6 +380,49 @@ function extractTelegramCommand(text: string): string | null {
   const firstToken = text.trim().split(/\s+/, 1)[0];
   if (!firstToken.startsWith("/")) return null;
   return firstToken.split("@", 1)[0].toLowerCase();
+}
+
+// Reads the subscription usage quota from the same undocumented endpoint the
+// Claude Code CLI itself uses, via the OAuth token already on disk. Read-only,
+// against this account's own usage; no separate credential needed.
+interface UsageQuota {
+  fiveHourPercent: number | null;
+  fiveHourResetsAt: string | null;
+  weeklyPercent: number | null;
+  weeklyResetsAt: string | null;
+  weeklyModelPercent: number | null;
+  weeklyModelLabel: string | null;
+  weeklyModelResetsAt: string | null;
+}
+
+async function fetchUsageQuota(): Promise<UsageQuota | null> {
+  try {
+    const credsPath = join(homedir(), ".claude", ".credentials.json");
+    const creds = JSON.parse(await readFile(credsPath, "utf-8"));
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (!token) return null;
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    const limits: any[] = Array.isArray(data.limits) ? data.limits : [];
+    const modelLimit = limits.find((l) => l.kind === "weekly_scoped");
+    return {
+      fiveHourPercent: data.five_hour?.utilization ?? null,
+      fiveHourResetsAt: data.five_hour?.resets_at ?? null,
+      weeklyPercent: data.seven_day?.utilization ?? null,
+      weeklyResetsAt: data.seven_day?.resets_at ?? null,
+      weeklyModelPercent: modelLimit?.percent ?? null,
+      weeklyModelLabel: modelLimit?.scope?.model?.display_name ?? null,
+      weeklyModelResetsAt: modelLimit?.resets_at ?? null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
@@ -1155,6 +1199,29 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/usage") {
+    const usage = await fetchUsageQuota();
+    if (!usage) {
+      await sendMessage(config.token, chatId, "Couldn't fetch usage quota (endpoint unreachable, or no cached OAuth credentials).", threadId);
+      return;
+    }
+    const fmtReset = (iso: string | null) => {
+      if (!iso) return "unknown";
+      return new Date(iso).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    };
+    const pct = (n: number | null) => (n == null ? "?" : `${n}%`);
+    const lines = [
+      "📊 Usage quota:",
+      `• 5h session: ${pct(usage.fiveHourPercent)} (resets ${fmtReset(usage.fiveHourResetsAt)})`,
+      `• Weekly (all models): ${pct(usage.weeklyPercent)} (resets ${fmtReset(usage.weeklyResetsAt)})`,
+    ];
+    if (usage.weeklyModelPercent != null) {
+      lines.push(`• Weekly (${usage.weeklyModelLabel ?? "scoped"}): ${pct(usage.weeklyModelPercent)} (resets ${fmtReset(usage.weeklyModelResetsAt)})`);
+    }
+    await sendMessage(config.token, chatId, lines.join("\n"), threadId);
+    return;
+  }
+
   if (command === "/kill") {
     // Scoped to this topic — with threads running in parallel, an unscoped kill
     // would take down work the user can't even see from here.
@@ -1757,6 +1824,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "start", description: "👋 Welcome message" },
       { command: "status", description: "📊 Session info and stats" },
       { command: "context", description: "📐 Context window usage" },
+      { command: "usage", description: "📊 Subscription quota (5h/weekly)" },
       { command: "reset", description: "🔄 Start fresh session" },
       { command: "compact", description: "🗜️ Reduce context size" },
       // Model selection
@@ -1796,7 +1864,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "usage", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
