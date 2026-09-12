@@ -8,6 +8,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { findSessionJsonlPath } from "../sessionFiles";
 import { resolveSkillPrompt, listSkills } from "../skills";
@@ -381,6 +382,49 @@ function extractTelegramCommand(text: string): string | null {
   return firstToken.split("@", 1)[0].toLowerCase();
 }
 
+// Reads the subscription usage quota from the same undocumented endpoint the
+// Claude Code CLI itself uses, via the OAuth token already on disk. Read-only,
+// against this account's own usage; no separate credential needed.
+interface UsageQuota {
+  fiveHourPercent: number | null;
+  fiveHourResetsAt: string | null;
+  weeklyPercent: number | null;
+  weeklyResetsAt: string | null;
+  weeklyModelPercent: number | null;
+  weeklyModelLabel: string | null;
+  weeklyModelResetsAt: string | null;
+}
+
+async function fetchUsageQuota(): Promise<UsageQuota | null> {
+  try {
+    const credsPath = join(homedir(), ".claude", ".credentials.json");
+    const creds = JSON.parse(await readFile(credsPath, "utf-8"));
+    const token = creds?.claudeAiOauth?.accessToken;
+    if (!token) return null;
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    const limits: any[] = Array.isArray(data.limits) ? data.limits : [];
+    const modelLimit = limits.find((l) => l.kind === "weekly_scoped");
+    return {
+      fiveHourPercent: data.five_hour?.utilization ?? null,
+      fiveHourResetsAt: data.five_hour?.resets_at ?? null,
+      weeklyPercent: data.seven_day?.utilization ?? null,
+      weeklyResetsAt: data.seven_day?.resets_at ?? null,
+      weeklyModelPercent: modelLimit?.percent ?? null,
+      weeklyModelLabel: modelLimit?.scope?.model?.display_name ?? null,
+      weeklyModelResetsAt: modelLimit?.resets_at ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
   // Add 15s buffer on top of Telegram's own long-poll timeout (default 30s)
   const telegramTimeout = (body?.timeout as number | undefined) ?? 0;
@@ -464,10 +508,14 @@ async function sendDocumentToChat(
 const verboseChats = new Set<number>();
 
 // Model overrides per chat ID
-const chatModels = new Map<number, string>();
+const chatModels = new Map<string, string>();
+function modelKey(chatId: number, threadId?: number): string {
+  return threadId ? `${chatId}:${threadId}` : String(chatId);
+}
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
+const MODEL_FABLE = "claude-fable-5-1";
 
 /**
  * Build a streaming callback using editMessageText.
@@ -777,6 +825,11 @@ let botId: number | null = null;
 
 function groupTriggerReason(message: TelegramMessage): string | null {
   if (botId && message.reply_to_message?.from?.id === botId) return "reply_to_bot";
+
+  // listenChats must be checked before the text guard so photo-only messages still trigger
+  const { telegram } = getSettings();
+  if (telegram.listenChats?.includes(message.chat.id)) return "listen_chat";
+
   const { text, entities } = getMessageTextAndEntities(message);
   if (!text) return null;
   const lowerText = text.toLowerCase();
@@ -794,9 +847,6 @@ function groupTriggerReason(message: TelegramMessage): string | null {
       if (botUsername && value.toLowerCase().endsWith(`@${botUsername.toLowerCase()}`)) return "scoped_command_matches_bot";
     }
   }
-
-  const { telegram } = getSettings();
-  if (telegram.listenChats?.includes(message.chat.id)) return "listen_chat";
 
   return null;
 }
@@ -1149,6 +1199,32 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/usage") {
+    const usage = await fetchUsageQuota();
+    if (!usage) {
+      await sendMessage(config.token, chatId, "Couldn't fetch usage quota (endpoint unreachable, or no cached OAuth credentials).", threadId);
+      return;
+    }
+    const fmtReset = (iso: string | null) => {
+      if (!iso) return "unknown";
+      return new Date(iso).toLocaleString("en-US", {
+        timeZone: "America/Los_Angeles",
+        weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      }) + " PT";
+    };
+    const pct = (n: number | null) => (n == null ? "?" : `${n}% used`);
+    const lines = [
+      "📊 Usage quota:",
+      `• 5h session: ${pct(usage.fiveHourPercent)} (resets ${fmtReset(usage.fiveHourResetsAt)})`,
+      `• Weekly (all models): ${pct(usage.weeklyPercent)} (resets ${fmtReset(usage.weeklyResetsAt)})`,
+    ];
+    if (usage.weeklyModelPercent != null) {
+      lines.push(`• Weekly (${usage.weeklyModelLabel ?? "scoped"}): ${pct(usage.weeklyModelPercent)} (resets ${fmtReset(usage.weeklyModelResetsAt)})`);
+    }
+    await sendMessage(config.token, chatId, lines.join("\n"), threadId);
+    return;
+  }
+
   if (command === "/kill") {
     // Scoped to this topic — with threads running in parallel, an unscoped kill
     // would take down work the user can't even see from here.
@@ -1169,41 +1245,75 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/model") {
-    const currentModel = chatModels.get(chatId);
+    const currentModel = chatModels.get(modelKey(chatId, threadId));
     const settings = getSettings();
     const defaultModel = settings.model || "default";
+    const optionsList = "\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modelfable - Fable 5.1\n• /modelid <id> - Any model ID (see /modelids)\n• /modeldefault - Use config default\n\nScope: this topic only.";
     if (!currentModel) {
-      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced (default)\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default`, threadId);
+      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)${optionsList}`, threadId);
     } else {
-      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel;
-      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default (${defaultModel})`, threadId);
+      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel === MODEL_FABLE ? "Fable 5.1" : currentModel;
+      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**${optionsList}`, threadId);
     }
     return;
   }
 
+  if (command === "/modelids") {
+    const settings = getSettings();
+    const lines = [
+      "📋 Model IDs:",
+      `• Haiku: \`${MODEL_HAIKU}\``,
+      `• Sonnet: \`${MODEL_SONNET}\``,
+      `• Opus: \`${MODEL_OPUS}\``,
+      `• Fable 5.1: \`${MODEL_FABLE}\``,
+      `• Config default: \`${settings.model || "(unset)"}\``,
+      "",
+      "Use /modelid <id> to switch to any of these (or another valid model ID) for this topic.",
+    ];
+    await sendMessage(config.token, chatId, lines.join("\n"), threadId);
+    return;
+  }
+
   if (command === "/modelhaiku") {
-    chatModels.set(chatId, MODEL_HAIKU);
-    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_HAIKU);
+    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelsonnet") {
-    chatModels.set(chatId, MODEL_SONNET);
-    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_SONNET);
+    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelopus") {
-    chatModels.set(chatId, MODEL_OPUS);
-    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses.", threadId);
+    chatModels.set(modelKey(chatId, threadId), MODEL_OPUS);
+    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses. (this topic only)", threadId);
+    return;
+  }
+
+  if (command === "/modelfable") {
+    chatModels.set(modelKey(chatId, threadId), MODEL_FABLE);
+    await sendMessage(config.token, chatId, "📖 Switched to Fable 5.1. (this topic only)", threadId);
+    return;
+  }
+
+  if (command === "/modelid") {
+    const modelId = text.replace(/^\/modelid(@\S+)?\s*/i, "").trim();
+    if (!modelId) {
+      await sendMessage(config.token, chatId, "Usage: /modelid <model-id>\n\nSee /modelids for known IDs.", threadId);
+      return;
+    }
+    chatModels.set(modelKey(chatId, threadId), modelId);
+    await sendMessage(config.token, chatId, `📊 Switched to \`${modelId}\`. (this topic only)`, threadId);
     return;
   }
 
   if (command === "/modeldefault") {
-    chatModels.delete(chatId);
+    chatModels.delete(modelKey(chatId, threadId));
     const settings = getSettings();
     const defaultModel = settings.model || "default";
-    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel}`, threadId);
+    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel} (this topic only)`, threadId);
     return;
   }
 
@@ -1465,7 +1575,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     // run in THIS thread should block. A busy topic must not gate a different one.
     const busy = isThreadBusy(sessionKey);
     const verbose = verboseChats.has(chatId);
-    const modelOverride = chatModels.get(chatId);
+    const modelOverride = chatModels.get(modelKey(chatId, threadId));
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
@@ -1717,6 +1827,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "start", description: "👋 Welcome message" },
       { command: "status", description: "📊 Session info and stats" },
       { command: "context", description: "📐 Context window usage" },
+      { command: "usage", description: "📊 Subscription quota (5h/weekly)" },
       { command: "reset", description: "🔄 Start fresh session" },
       { command: "compact", description: "🗜️ Reduce context size" },
       // Model selection
@@ -1724,6 +1835,9 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "modelhaiku", description: "⚡ Switch to Haiku (fastest)" },
       { command: "modelsonnet", description: "⚖️ Switch to Sonnet (balanced)" },
       { command: "modelopus", description: "🧠 Switch to Opus (most capable)" },
+      { command: "modelfable", description: "📖 Switch to Fable 5.1" },
+      { command: "modelid", description: "📊 Switch to any model ID" },
+      { command: "modelids", description: "📋 List known model IDs" },
       { command: "modeldefault", description: "🔄 Reset to config default model" },
       // Mode toggles
       { command: "mode", description: "🔐 Get or set Claude permission mode" },
@@ -1753,7 +1867,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "usage", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
