@@ -1209,7 +1209,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       if (!iso) return "unknown";
       return new Date(iso).toLocaleString("en-US", {
         timeZone: "America/Los_Angeles",
-        month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+        weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
       }) + " PT";
     };
     const pct = (n: number | null) => (n == null ? "?" : `${n}% used`);
