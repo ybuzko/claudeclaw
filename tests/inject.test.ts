@@ -10,6 +10,7 @@ function makeDeps(overrides: Partial<InjectDeps> = {}) {
   const deps: InjectDeps = {
     run: async () => ({ stdout: "  hello from claude  ", exitCode: 0 }),
     peekSession: async () => ({ sessionId: "11111111-1111-4111-8111-111111111111" }),
+    peekThreadSession: async () => ({ sessionId: "22222222-2222-4222-8222-222222222222" }),
     telegram,
     sendTelegram: async (token, chatId, text) => {
       sent.push({ token, chatId, text });
@@ -29,6 +30,21 @@ describe("parseInjectBody", () => {
 
   it("trims the message and defaults forward to true", () => {
     assert.deepEqual(parseInjectBody({ message: "  hi  " }), { message: "hi", forward: true });
+  });
+
+  it("takes an optional trimmed thread key and omits it when blank or not a string", () => {
+    assert.deepEqual(parseInjectBody({ message: "hi", thread: " tg:-100123:45 " }), {
+      message: "hi",
+      forward: true,
+      thread: "tg:-100123:45",
+    });
+    assert.deepEqual(parseInjectBody({ message: "hi", thread: "   " }), { message: "hi", forward: true });
+    assert.deepEqual(parseInjectBody({ message: "hi", thread: 7 }), { message: "hi", forward: true });
+    assert.deepEqual(parseInjectBody({ message: "hi", forward: false, thread: "tg:-100123" }), {
+      message: "hi",
+      forward: false,
+      thread: "tg:-100123",
+    });
   });
 
   it("only a strict boolean false disables forwarding", () => {
@@ -107,13 +123,63 @@ describe("handleInject sessionId", () => {
   });
 });
 
+describe("handleInject thread", () => {
+  it("routes the turn to the thread and returns that thread's session id", async () => {
+    const seen: Array<[string, string | undefined]> = [];
+    const peeked: string[] = [];
+    const { deps } = makeDeps({
+      run: async (m, t) => { seen.push([m, t]); return { stdout: "ok", exitCode: 0 }; },
+      peekSession: async () => { throw new Error("global session must not be read"); },
+      peekThreadSession: async (t) => { peeked.push(t); return { sessionId: "22222222-2222-4222-8222-222222222222" }; },
+    });
+    const res = await handleInject({ message: "hi", forward: false, thread: "tg:-100123:45" }, deps);
+    assert.deepEqual(seen, [["hi", "tg:-100123:45"]]);
+    assert.deepEqual(peeked, ["tg:-100123:45"]);
+    assert.equal(res.sessionId, "22222222-2222-4222-8222-222222222222");
+  });
+
+  it("without a thread keeps the global path: no thread passed, main session id returned", async () => {
+    const seen: Array<[string, string | undefined]> = [];
+    const { deps } = makeDeps({
+      run: async (m, t) => { seen.push([m, t]); return { stdout: "ok", exitCode: 0 }; },
+      peekThreadSession: async () => { throw new Error("thread session must not be read"); },
+    });
+    const res = await handleInject({ message: "hi", forward: false }, deps);
+    assert.deepEqual(seen, [["hi", undefined]]);
+    assert.equal(res.sessionId, "11111111-1111-4111-8111-111111111111");
+  });
+
+  it("returns null when the thread has no session yet or the lookup throws", async () => {
+    const none = makeDeps({ peekThreadSession: async () => null });
+    assert.equal((await handleInject({ message: "hi", forward: false, thread: "tg:1" }, none.deps)).sessionId, null);
+
+    const throwing = makeDeps({ peekThreadSession: async () => { throw new Error("unreadable sessions.json"); } });
+    const res = await handleInject({ message: "hi", forward: false, thread: "tg:1" }, throwing.deps);
+    assert.equal(res.ok, true);
+    assert.equal(res.sessionId, null);
+  });
+
+  it("forward:false still suppresses Telegram on the thread path, and forward:true still sends", async () => {
+    const quiet = makeDeps();
+    await handleInject({ message: "hi", forward: false, thread: "tg:1" }, quiet.deps);
+    assert.deepEqual(quiet.sent, []);
+
+    const loud = makeDeps();
+    await handleInject({ message: "hi", forward: true, thread: "tg:1" }, loud.deps);
+    assert.deepEqual(loud.sent, [{ token: "bot-token", chatId: 42, text: "hello from claude" }]);
+  });
+});
+
 describe("server wiring", () => {
   it("the /api/inject route delegates to the tested helpers", () => {
     const src = readServerSource();
     assert.match(src, /import \{ handleInject, parseInjectBody \} from "\.\/services\/inject";/);
     assert.match(src, /const parsed = parseInjectBody\(await req\.json\(\)\);/);
     assert.match(src, /await handleInject\(parsed, \{/);
+    assert.match(src, /run: \(message, thread\) => runUserMessage\("inject", message, thread\),/);
     assert.match(src, /peekSession: \(\) => peekSession\(\),/);
+    assert.match(src, /peekThreadSession: \(thread\) => peekThreadSession\(thread\),/);
+    assert.match(src, /import \{ peekThreadSession \} from "\.\.\/sessionManager";/);
   });
 });
 

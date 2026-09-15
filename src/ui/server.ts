@@ -10,6 +10,7 @@ import { listSessions, readSessionMessages, listAgents } from "./services/sessio
 import { getSessionUsage } from "./services/usage";
 import { runUserMessage } from "../runner";
 import { peekSession } from "../sessions";
+import { peekThreadSession } from "../sessionManager";
 import { handleInject, parseInjectBody } from "./services/inject";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
@@ -246,8 +247,9 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           if (!parsed) return json({ ok: false, error: "message is required" }, 400);
           const { telegram } = opts.getSnapshot().settings;
           const response = await handleInject(parsed, {
-            run: (message) => runUserMessage("inject", message),
+            run: (message, thread) => runUserMessage("inject", message, thread),
             peekSession: () => peekSession(),
+            peekThreadSession: (thread) => peekThreadSession(thread),
             telegram,
           });
           return json(response);
