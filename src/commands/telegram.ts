@@ -504,6 +504,34 @@ async function sendDocumentToChat(
   }
 }
 
+async function sendVideoToChat(
+  token: string,
+  chatId: number,
+  filePath: string,
+  threadId?: number
+): Promise<void> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    console.error(`[Telegram] sendVideo: file not found: ${filePath}`);
+    return;
+  }
+
+  const fileName = filePath.split("/").pop() ?? "video";
+  const formData = new FormData();
+  formData.append("chat_id", String(chatId));
+  formData.append("video", file, fileName);
+  if (threadId) formData.append("message_thread_id", String(threadId));
+
+  const res = await fetch(`${API_BASE}${token}/sendVideo`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Telegram sendVideo failed: ${res.status} ${body}`);
+  }
+}
+
 // Chat IDs with verbose tool display enabled
 const verboseChats = new Set<number>();
 
@@ -665,6 +693,23 @@ function extractSendFileDirectives(text: string): {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { cleanedText, filePaths };
+}
+
+function extractSendVideoDirectives(text: string): {
+  cleanedText: string;
+  videoPaths: string[];
+} {
+  const videoPaths: string[] = [];
+  const cleanedText = text
+    .replace(/\[send-video:([^\]\r\n]+)\]/gi, (_match, raw) => {
+      const candidate = String(raw).trim();
+      if (candidate) videoPaths.push(candidate);
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, videoPaths };
 }
 
 const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
@@ -1607,7 +1652,8 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       const hadVoiceDirective = /\[voice:\/[^\]\r\n]+\]/i.test(afterReact);
       const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
       const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
-      const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+      const { cleanedText: afterVideo, videoPaths } = extractSendVideoDirectives(afterFile);
+      const { cleanedText, buttonRows } = extractButtonsDirective(afterVideo);
       if (reactionEmoji) {
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
@@ -1622,7 +1668,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         }
       }
       // Whether the response is directive-only (attachment is the output, text is empty)
-      const isDirectiveOnly = !cleanedText && (buttonRows || filePaths.length > 0 || voicePaths.length > 0 || hadVoiceDirective);
+      const isDirectiveOnly = !cleanedText && (buttonRows || filePaths.length > 0 || videoPaths.length > 0 || voicePaths.length > 0 || hadVoiceDirective);
 
       if (buttonRows) {
         // Delete the stream preview before sending the button message — the
@@ -1686,7 +1732,15 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
         }
       }
-      if (!cleanedText && !buttonRows && filePaths.length === 0 && voicePaths.length === 0 && !hadVoiceDirective && !streamMsgId) {
+      for (const vidPath of videoPaths) {
+        try {
+          await sendVideoToChat(config.token, chatId, vidPath, threadId);
+        } catch (err) {
+          console.error(`[Telegram] Failed to send video for ${label}: ${err instanceof Error ? err.message : err}`);
+          await sendMessage(config.token, chatId, `Failed to send video: ${vidPath.split("/").pop()}`, threadId);
+        }
+      }
+      if (!cleanedText && !buttonRows && filePaths.length === 0 && voicePaths.length === 0 && videoPaths.length === 0 && !hadVoiceDirective && !streamMsgId) {
         await sendMessage(config.token, chatId, "(empty response)", threadId);
       }
     }
@@ -1788,7 +1842,8 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
         const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
         const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
         const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
-        const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+        const { cleanedText: afterVideo, videoPaths } = extractSendVideoDirectives(afterFile);
+        const { cleanedText, buttonRows } = extractButtonsDirective(afterVideo);
         if (reactionEmoji && query.message) {
           await sendReaction(config.token, chatId, query.message.message_id, reactionEmoji).catch(() => {});
         }
@@ -1802,6 +1857,9 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
         }
         for (const fp of filePaths) {
           await sendDocumentToChat(config.token, chatId, fp, threadId).catch(() => {});
+        }
+        for (const vidPath of videoPaths) {
+          await sendVideoToChat(config.token, chatId, vidPath, threadId).catch(() => {});
         }
       } else if (result.exitCode !== 0) {
         await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
@@ -1963,6 +2021,9 @@ async function poll(generation: number): Promise<void> {
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
 export { sendMessage };
+
+/** Pure helper exported for testing */
+export { extractSendVideoDirectives };
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });
