@@ -76,4 +76,7 @@ it("sums transcript retries and keeps cumulative fallback estimates separate", (
   assert.equal(mixed.basis, "result_json");
   assert.equal(mixed.outputTokens, 100, "cumulative JSON must not be added to transcript totals");
   assert.equal(combineAttemptUsages([null, second])?.basis, "result_json");
+  const timedOutCompact = combineAttemptUsages([first, null]);
+  assert.equal(timedOutCompact?.basis, "result_json");
+  assert.deepEqual(timedOutCompact?.session, { costUsd: null, numTurns: null, durationApiMs: null });
 });

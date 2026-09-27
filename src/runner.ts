@@ -1508,7 +1508,11 @@ async function execClaude(
       timeoutMs,
       spawnCwd
     );
-    attemptUsages.push(usageFromAttempt(null, await readTranscriptUsage(compactStart), Date.now() - compactStartedAt));
+    // A failed compact may have timed out and returned before its child stopped writing.
+    // Only a successful compact guarantees the transcript has reached a final offset.
+    attemptUsages.push(compactOk
+      ? usageFromAttempt(null, await readTranscriptUsage(compactStart), Date.now() - compactStartedAt)
+      : null);
     result.usage = combineAttemptUsages(attemptUsages);
     emitCompactEvent({ type: "auto-compact-done", success: compactOk });
     if (compactOk && pm) pm.emitAsync("after_compaction", {}, ctx);
