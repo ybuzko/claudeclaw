@@ -30,6 +30,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+import { combineAttemptUsages, freshTranscriptSnapshot, readTranscriptUsage, snapshotTranscript, usageFromAttempt, type TurnUsage } from "./turnUsage";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -153,6 +154,7 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  usage?: TurnUsage | null;
 }
 
 export interface AgentStreamEvent {
@@ -398,6 +400,35 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
   return childEnv;
 }
 
+/** Give a timed-out child a bounded chance to flush its transcript before reading usage. */
+export async function terminateAndWaitForExit(
+  proc: { kill: (signal: "SIGTERM" | "SIGKILL") => unknown; exited: Promise<unknown> },
+  graceMs = 5000,
+  settleMs = 500,
+): Promise<boolean> {
+  try { proc.kill("SIGTERM"); } catch {}
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const exited = proc.exited.then(() => true, () => true);
+  const endedDuringGrace = await Promise.race([
+    exited,
+    new Promise<false>((resolve) => {
+      graceTimer = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch {}
+        resolve(false);
+      }, graceMs);
+    }),
+  ]);
+  if (graceTimer) clearTimeout(graceTimer);
+  if (endedDuringGrace) return true;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  const endedAfterKill = await Promise.race([
+    exited,
+    new Promise<false>((resolve) => { settleTimer = setTimeout(() => resolve(false), settleMs); }),
+  ]);
+  if (settleTimer) clearTimeout(settleTimer);
+  return endedAfterKill;
+}
+
 /**
  * Resolve the subprocess timeout (in ms) for a given invocation category.
  * Values are read fresh from settings on every call, so hot-reload works
@@ -542,15 +573,22 @@ async function runClaudeStream(
   cwd?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void
-): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }> {
+): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string; usage: TurnUsage | null }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
+  const env = buildChildEnv(baseEnv, model, api);
+  const workspace = cwd ?? process.cwd();
+  const resumeIndex = args.indexOf("--resume");
+  const resumedId = resumeIndex >= 0 ? args[resumeIndex + 1] : undefined;
+  const transcriptStart = resumedId ? await snapshotTranscript(workspace, resumedId, env) : null;
+  const startedAt = Date.now();
+
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
-    env: buildChildEnv(baseEnv, model, api),
+    env,
     ...(cwd ? { cwd } : {}),
   });
 
@@ -558,6 +596,13 @@ async function runClaudeStream(
   let sessionId: string | undefined;
   let resultText = "";
   let stderr = "";
+  let resultEvent: Record<string, unknown> | null = null;
+
+  const readUsage = async (): Promise<TurnUsage | null> => {
+    const snapshot = transcriptStart ?? (sessionId ? freshTranscriptSnapshot(workspace, sessionId, env) : null);
+    const transcript = snapshot ? await readTranscriptUsage(snapshot) : null;
+    return usageFromAttempt(resultEvent, transcript, Date.now() - startedAt);
+  };
 
   // Streaming state for onChunk/onToolEvent callbacks
   let streamDelivered = "";
@@ -582,8 +627,9 @@ async function runClaudeStream(
           if ((event.type === "system" || event.type === "result") && typeof event.session_id === "string") {
             sessionId = event.session_id;
           }
-          if (event.type === "result" && typeof event.result === "string") {
-            resultText = event.result;
+          if (event.type === "result") {
+            resultEvent = event;
+            if (typeof event.result === "string") resultText = event.result;
           }
           // Emit streaming callbacks if provided
           if ((onChunk || onToolEvent) && event.type === "assistant" && (event.message as any)?.content) {
@@ -623,6 +669,17 @@ async function runClaudeStream(
         } catch {}
       }
     }
+    // A final result event need not end with a newline.
+    if (buf.trim()) {
+      try {
+        const event = JSON.parse(buf) as Record<string, unknown>;
+        if ((event.type === "system" || event.type === "result") && typeof event.session_id === "string") sessionId = event.session_id;
+        if (event.type === "result") {
+          resultEvent = event;
+          if (typeof event.result === "string") resultText = event.result;
+        }
+      } catch {}
+    }
   };
 
   const readStderr = async () => {
@@ -642,15 +699,15 @@ async function runClaudeStream(
     if (streamJsonTimeoutId) clearTimeout(streamJsonTimeoutId);
     await proc.exited;
     mainActiveProcs.delete(proc);
-    return { rawStdout: resultText, stderr: stderr.trim(), exitCode: proc.exitCode ?? 1, sessionId };
+    return { rawStdout: resultText, stderr: stderr.trim(), exitCode: proc.exitCode ?? 1, sessionId, usage: await readUsage() };
   } catch (err) {
     if (streamJsonTimeoutId) clearTimeout(streamJsonTimeoutId);
     mainActiveProcs.delete(proc);
-    try { proc.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    const stopped = await terminateAndWaitForExit(proc);
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[${new Date().toLocaleTimeString()}] ${message}`);
-    return { rawStdout: "", stderr: message, exitCode: 124, sessionId };
+    const usage = stopped ? await readUsage() : usageFromAttempt(resultEvent, null, Date.now() - startedAt);
+    return { rawStdout: "", stderr: message, exitCode: 124, sessionId, usage };
   }
 }
 
@@ -1201,8 +1258,14 @@ async function execClaude(
 
   const baseEnv = cleanSpawnEnv();
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
+  const attemptUsages: Array<TurnUsage | null> = [];
+  const runStream = async (...streamArgs: Parameters<typeof runClaudeStream>) => {
+    const attempt = await runClaudeStream(...streamArgs);
+    attemptUsages.push(attempt.usage);
+    return attempt;
+  };
 
-  let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+  let exec = await runStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -1218,7 +1281,7 @@ async function execClaude(
     if (appendParts.length > 0) {
       fallbackArgs.push("--append-system-prompt", appendParts.join("\n\n"));
     }
-    exec = await runClaudeStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+    exec = await runStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
     usedFallback = true;
     let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
@@ -1230,7 +1293,7 @@ async function execClaude(
         `[${new Date().toLocaleTimeString()}] Detected corrupted fallback session (thinking block signature mismatch). Reset${flabel}, retrying fallback fresh...`
       );
       const freshFallbackArgs = fallbackArgs.filter((a) => a !== "--resume" && a !== fallbackSession.sessionId);
-      exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+      exec = await runStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
       fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
       if (!fallbackRateLimit && exec.sessionId) {
         await createFallbackSession(exec.sessionId, agentName, threadId);
@@ -1270,7 +1333,7 @@ async function execClaude(
     const freshArgs = args.filter((a) => a !== "--resume" && a !== existing?.sessionId);
     const fmtIdx = freshArgs.indexOf("--output-format");
     if (fmtIdx !== -1 && fmtIdx + 1 < freshArgs.length) freshArgs[fmtIdx + 1] = "stream-json";
-    exec = await runClaudeStream(freshArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
+    exec = await runStream(freshArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
     rawStdout = exec.rawStdout;
     stderr = exec.stderr;
     exitCode = exec.exitCode;
@@ -1320,7 +1383,7 @@ async function execClaude(
 
     const retryArgs = withOutputFormat(stripResume(args), "stream-json");
     const retryConfig = usedFallback ? fallbackConfig : primaryConfig;
-    exec = await runClaudeStream(
+    exec = await runStream(
       retryArgs,
       retryConfig.model,
       retryConfig.api,
@@ -1381,6 +1444,7 @@ async function execClaude(
     stdout,
     stderr,
     exitCode,
+    usage: combineAttemptUsages(attemptUsages),
   };
 
   // Plugins: agent_end — fire-and-forget, does not block response
@@ -1432,6 +1496,9 @@ async function execClaude(
   // --- Auto-compact on timeout (exit 124) ---
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
     emitCompactEvent({ type: "auto-compact-start" });
+    const compactEnv = buildChildEnv(baseEnv, primaryConfig.model, primaryConfig.api);
+    const compactStart = await snapshotTranscript(spawnCwd ?? process.cwd(), existing.sessionId, compactEnv);
+    const compactStartedAt = Date.now();
     const compactOk = await runCompact(
       existing.sessionId,
       primaryConfig.model,
@@ -1441,16 +1508,23 @@ async function execClaude(
       timeoutMs,
       spawnCwd
     );
+    // A failed compact may have timed out and returned before its child stopped writing.
+    // Only a successful compact guarantees the transcript has reached a final offset.
+    attemptUsages.push(compactOk
+      ? usageFromAttempt(null, await readTranscriptUsage(compactStart), Date.now() - compactStartedAt)
+      : null);
+    result.usage = combineAttemptUsages(attemptUsages);
     emitCompactEvent({ type: "auto-compact-done", success: compactOk });
     if (compactOk && pm) pm.emitAsync("after_compaction", {}, ctx);
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
+      const retryExec = await runStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
         exitCode: retryExec.exitCode,
+        usage: combineAttemptUsages(attemptUsages),
       };
       emitCompactEvent({
         type: "auto-compact-retry",

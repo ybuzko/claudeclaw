@@ -6,10 +6,13 @@
  *    forwarded to Telegram. Machine callers such as the Paperclip claudeclaw_gateway
  *    adapter use this so their wake turns are not echoed to the human's chat.
  *  - `sessionId` response field: the main session id, or `null` if unavailable.
+ *  - `usage` response field: per-turn token usage, or `null` when unavailable.
  *  - `thread` request field (optional). When set, the turn runs in that thread's queue
  *    and session (the same `tg:<chatId>:<topicId>` keys the Telegram handler uses) instead
  *    of the global session, and `sessionId` is that thread's session id.
  */
+
+import type { TurnUsage } from "../../turnUsage";
 
 export interface InjectRequest {
   message: string;
@@ -24,10 +27,11 @@ export interface InjectResponse {
   result: string;
   exitCode: number;
   sessionId: string | null;
+  usage: TurnUsage | null;
 }
 
 export interface InjectDeps {
-  run: (message: string, thread?: string) => Promise<{ stdout: string; exitCode: number }>;
+  run: (message: string, thread?: string) => Promise<{ stdout: string; exitCode: number; usage?: TurnUsage | null }>;
   peekSession: () => Promise<{ sessionId?: string } | null>;
   peekThreadSession: (thread: string) => Promise<{ sessionId?: string } | null>;
   telegram: { token: string; allowedUserIds: number[] };
@@ -74,5 +78,6 @@ export async function handleInject(req: InjectRequest, deps: InjectDeps): Promis
     result: result.stdout,
     exitCode: result.exitCode,
     sessionId: session?.sessionId ?? null,
+    usage: result.usage ?? null,
   };
 }

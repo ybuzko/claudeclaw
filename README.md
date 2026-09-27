@@ -99,6 +99,23 @@ Authorization: Bearer <contents of .claude/claudeclaw/web.token>
 
 Existing `/api/inject` users who configured `settings.apiToken` are unaffected; that fallback still works.
 
+The blocking `POST /api/inject` response includes `usage`. Its token counts and per-model
+`requests` come from assistant records appended to the session's main JSONL and
+`<sessionId>/subagents/*.jsonl` files during the queued turn. Existing files start at their
+pre-spawn offsets and new child files at byte 0. Records are deduplicated by `requestId`
+across the whole tree (main first, then child filenames in lexical order). `basis: "transcript"`
+identifies those per-turn totals. Complete malformed JSONL lines, including NUL-filled lines,
+are skipped and counted in `malformedLines` (zero when none were skipped). If any required file
+cannot be read, shrinks, changes identity, or ends without a newline, `basis: "result_json"` flags a
+potentially cumulative result JSON estimate; `requests: 0` then means the per-turn request count
+is unknown, and `malformedLines: null` means the transcript count is unknown. `session` contains
+cumulative `costUsd`, `numTurns`, and `durationApiMs` when Claude reports them. Multiple
+transcript-backed attempts in one turn are summed; mixed or unavailable attempts retain the
+final readable estimate with `basis: "result_json"` and `malformedLines: null`. `usage` is `null`
+when no usage source is readable.
+After a CLI timeout, inject may wait up to about 5.5 seconds for the child to exit before
+reading its transcript. If it still has not exited, usage falls back to result JSON or `null`.
+
 ### v1.1.0 — Discord text-attachment truncation limit reduced
 
 Text attachments sent to the Discord bot are now truncated at **2,048 bytes** (previously 51,200). Payloads over that limit have `…[truncated]` appended silently; there is no config knob to restore the old limit.

@@ -69,6 +69,7 @@ describe("handleInject forward flag", () => {
     assert.equal(res.ok, true);
     assert.equal(res.result, "  hello from claude  ");
     assert.equal(res.exitCode, 0);
+    assert.equal(res.usage, null);
   });
 
   it("does not forward when Telegram is not configured or the reply is empty", async () => {
@@ -93,6 +94,22 @@ describe("handleInject forward flag", () => {
 });
 
 describe("handleInject sessionId", () => {
+  it("returns the exact usage contract from the queued runner result", async () => {
+    const usage = {
+      provider: "anthropic" as const, inputTokens: 3, outputTokens: 9,
+      cacheReadInputTokens: 5, cacheCreationInputTokens: 7, requests: 1,
+      durationMs: 12, model: "haiku",
+      modelUsage: { haiku: { inputTokens: 3, outputTokens: 9, cacheReadInputTokens: 5, cacheCreationInputTokens: 7, requests: 1 } },
+      basis: "transcript" as const,
+      malformedLines: 0,
+      session: { costUsd: 1.2, numTurns: 2, durationApiMs: 10 },
+    };
+    const { deps } = makeDeps({ run: async () => ({ stdout: "ok", exitCode: 0, usage }) });
+    const res = await handleInject({ message: "hi", forward: false }, deps);
+    assert.deepEqual(res.usage, usage);
+    assert.deepEqual(Object.keys(res).sort(), ["exitCode", "ok", "result", "sessionId", "usage"]);
+  });
+
   it("returns the main session id from peekSession", async () => {
     const { deps } = makeDeps();
     const res = await handleInject({ message: "hi", forward: false }, deps);
