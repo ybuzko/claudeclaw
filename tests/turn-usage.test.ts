@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { it } from "node:test";
-import { combineAttemptUsages, readTranscriptUsage, snapshotTranscript, transcriptPath, usageFromAttempt } from "../src/turnUsage";
+import { combineAttemptUsages, freshTranscriptSnapshot, readTranscriptUsage, snapshotTranscript, subagentsDirFor, transcriptPath, usageFromAttempt } from "../src/turnUsage";
 
 it("sums only appended assistant requests, first occurrence wins across models", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "claudeclaw-usage-"));
@@ -34,6 +34,88 @@ it("sums only appended assistant requests, first occurrence wins across models",
       basis: "transcript", session: { costUsd: 1.2, numTurns: 99, durationApiMs: 1234 },
     });
     assert.match(file, /project-with-dots/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const childRecord = (requestId: string, model: string, outputTokens: number) => JSON.stringify({
+  type: "assistant", requestId, isSidechain: true,
+  message: { role: "assistant", model, usage: {
+    input_tokens: 1, output_tokens: outputTokens, cache_read_input_tokens: 2, cache_creation_input_tokens: 3,
+  } },
+}) + "\n";
+
+it("includes old and new subagent files, dedupes across files, and isolates the session path", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "claudeclaw-tree-"));
+  const env = { CLAUDE_CONFIG_DIR: path.join(root, "claude config") };
+  const workspace = path.join(root, "project.with.dots");
+  const sessionId = "00000000-0000-0000-0000-000000000001";
+  const main = transcriptPath(workspace, sessionId, env);
+  const children = subagentsDirFor(main);
+  try {
+    await mkdir(children, { recursive: true });
+    await writeFile(main, childRecord("old-main", "old", 100));
+    await writeFile(path.join(children, "agent-old.jsonl"), childRecord("old-child", "old", 100));
+    const otherSession = subagentsDirFor(transcriptPath(workspace, "00000000-0000-0000-0000-000000000002", env));
+    await mkdir(otherSession, { recursive: true });
+    await writeFile(path.join(otherSession, "agent-other.jsonl"), childRecord("other", "wrong-session", 999));
+
+    const snapshot = await snapshotTranscript(workspace, sessionId, env);
+    await appendFile(main, childRecord("r-main", "haiku", 10));
+    await appendFile(path.join(children, "agent-old.jsonl"), childRecord("r-old", "sonnet", 20));
+    await writeFile(path.join(children, "agent-new.jsonl"),
+      childRecord("r-main", "duplicate", 999) + childRecord("r-new", "opus", 30));
+
+    const transcript = await readTranscriptUsage(snapshot);
+    const usage = usageFromAttempt(null, transcript, 25);
+    assert.equal(usage?.basis, "transcript");
+    assert.equal(usage?.requests, 3);
+    assert.equal(usage?.outputTokens, 60);
+    assert.equal(usage?.model, "opus");
+    assert.deepEqual(Object.keys(usage!.modelUsage).sort(), ["haiku", "opus", "sonnet"]);
+    assert.equal(usage?.modelUsage.duplicate, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("reads a fresh session's main and child files from byte zero once its ID is reported", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "claudeclaw-fresh-tree-"));
+  const env = { CLAUDE_CONFIG_DIR: root };
+  const sessionId = "00000000-0000-0000-0000-000000000001";
+  const snapshot = freshTranscriptSnapshot(root, sessionId, env);
+  try {
+    await mkdir(snapshot.subagentsDir, { recursive: true });
+    await writeFile(snapshot.path, childRecord("main", "haiku", 5));
+    await writeFile(path.join(snapshot.subagentsDir, "agent-new.jsonl"), childRecord("child", "opus", 15));
+    const usage = usageFromAttempt(null, await readTranscriptUsage(snapshot), 12);
+    assert.equal(usage?.requests, 2);
+    assert.equal(usage?.outputTokens, 20);
+    assert.equal(usage?.model, "opus");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("rejects a replaced or incomplete subagent file instead of returning partial usage", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "claudeclaw-tree-"));
+  const env = { CLAUDE_CONFIG_DIR: root };
+  const sessionId = "00000000-0000-0000-0000-000000000001";
+  const main = transcriptPath(root, sessionId, env);
+  const children = subagentsDirFor(main);
+  const old = path.join(children, "agent-old.jsonl");
+  try {
+    await mkdir(children, { recursive: true });
+    await writeFile(main, "");
+    await writeFile(old, childRecord("before", "sonnet", 10));
+    const replaced = await snapshotTranscript(root, sessionId, env);
+    await rename(old, `${old}.moved`);
+    await writeFile(old, childRecord("after", "sonnet", 20));
+    assert.equal(await readTranscriptUsage(replaced), null);
+    const incomplete = await snapshotTranscript(root, sessionId, env);
+    await writeFile(path.join(children, "agent-new.jsonl"), childRecord("new", "opus", 3).trimEnd());
+    assert.equal(await readTranscriptUsage(incomplete), null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -100,14 +100,18 @@ Authorization: Bearer <contents of .claude/claudeclaw/web.token>
 Existing `/api/inject` users who configured `settings.apiToken` are unaffected; that fallback still works.
 
 The blocking `POST /api/inject` response includes `usage`. Its token counts and per-model
-`requests` come from assistant records appended to the Claude session transcript during the
-queued turn, deduplicated by `requestId` (first record wins). `basis: "transcript"` identifies
-those per-turn totals. If the transcript cannot be read, `basis: "result_json"` flags a
+`requests` come from assistant records appended to the session's main JSONL and
+`<sessionId>/subagents/*.jsonl` files during the queued turn. Existing files start at their
+pre-spawn offsets and new child files at byte 0. Records are deduplicated by `requestId`
+across the whole tree (main first, then child filenames in lexical order). `basis: "transcript"`
+identifies those per-turn totals. If any required file cannot be read, `basis: "result_json"` flags a
 potentially cumulative result JSON estimate; `requests: 0` then means the per-turn request count
 is unknown. `session` contains cumulative `costUsd`, `numTurns`, and `durationApiMs` when Claude
 reports them. Multiple transcript-backed attempts in one turn are summed; mixed or unavailable
 attempts retain the final readable estimate with `basis: "result_json"`. `usage` is `null` when
 no usage source is readable.
+After a CLI timeout, inject may wait up to about 5.5 seconds for the child to exit before
+reading its transcript. If it still has not exited, usage falls back to result JSON or `null`.
 
 ### v1.1.0 — Discord text-attachment truncation limit reduced
 

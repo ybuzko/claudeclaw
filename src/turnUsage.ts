@@ -1,5 +1,5 @@
-// Read only the bytes appended to one Claude session transcript during a spawn attempt.
-import { open, stat } from "node:fs/promises";
+// Read only bytes appended to a Claude session's main and subagent transcripts.
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { sanitizeProjectSlug } from "./sessionFiles";
@@ -21,7 +21,13 @@ export type TurnUsage = ModelUsage & {
   session: { costUsd: number | null; numTurns: number | null; durationApiMs: number | null };
 };
 
-export type TranscriptSnapshot = { path: string; offset: number; identity: string | null; readable: boolean };
+type FileSnapshot = { path: string; offset: number; identity: string | null; readable: boolean };
+export type TranscriptSnapshot = FileSnapshot & {
+  subagentsDir: string;
+  subagentsIdentity: string | null;
+  subagentsReadable: boolean;
+  subagentFiles: Record<string, FileSnapshot>;
+};
 export type TranscriptUsage = { modelUsage: Record<string, ModelUsage>; requests: number };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -41,14 +47,21 @@ export function transcriptPath(workspace: string, sessionId: string, env: NodeJS
   return path.join(root, "projects", sanitizeProjectSlug(workspace), `${sessionId}.jsonl`);
 }
 
-/** A fresh Claude invocation discovers its session ID from stream-json after it starts. */
-export function freshTranscriptSnapshot(workspace: string, sessionId: string, env: NodeJS.ProcessEnv): TranscriptSnapshot {
-  return { path: transcriptPath(workspace, sessionId, env), offset: 0, identity: null, readable: true };
+export function subagentsDirFor(transcript: string): string {
+  return path.join(path.dirname(transcript), path.basename(transcript, ".jsonl"), "subagents");
 }
 
-/** Capture the exact file and byte offset immediately before spawning Claude. */
-export async function snapshotTranscript(workspace: string, sessionId: string, env: NodeJS.ProcessEnv): Promise<TranscriptSnapshot> {
+/** A fresh Claude invocation discovers its session ID from stream-json after it starts. */
+export function freshTranscriptSnapshot(workspace: string, sessionId: string, env: NodeJS.ProcessEnv): TranscriptSnapshot {
   const file = transcriptPath(workspace, sessionId, env);
+  return {
+    path: file, offset: 0, identity: null, readable: true,
+    subagentsDir: subagentsDirFor(file), subagentsIdentity: null, subagentsReadable: true,
+    subagentFiles: Object.create(null),
+  };
+}
+
+async function snapshotFile(file: string): Promise<FileSnapshot> {
   try {
     const stats = await stat(file);
     return { path: file, offset: stats.size, identity: identity(stats), readable: stats.isFile() };
@@ -58,8 +71,32 @@ export async function snapshotTranscript(workspace: string, sessionId: string, e
   }
 }
 
-/** Returns null if the appended range cannot be read completely and trusted. */
-export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise<TranscriptUsage | null> {
+/** Capture the main file and every existing subagent offset immediately before spawning. */
+export async function snapshotTranscript(workspace: string, sessionId: string, env: NodeJS.ProcessEnv): Promise<TranscriptSnapshot> {
+  const main = await snapshotFile(transcriptPath(workspace, sessionId, env));
+  const subagentsDir = subagentsDirFor(main.path);
+  const subagentFiles: Record<string, FileSnapshot> = Object.create(null);
+  let subagentsIdentity: string | null = null;
+  let subagentsReadable = true;
+  try {
+    const stats = await stat(subagentsDir);
+    if (!stats.isDirectory()) subagentsReadable = false;
+    else {
+      subagentsIdentity = identity(stats);
+      const names = (await readdir(subagentsDir)).filter((name) => name.endsWith(".jsonl"));
+      for (const name of names) {
+        const file = await snapshotFile(path.join(subagentsDir, name));
+        subagentFiles[name] = file;
+        if (file.identity === null || !file.readable) subagentsReadable = false;
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") subagentsReadable = false;
+  }
+  return { ...main, subagentsDir, subagentsIdentity, subagentsReadable, subagentFiles };
+}
+
+async function readDelta(snapshot: FileSnapshot): Promise<string | null> {
   if (!snapshot.readable) return null;
   let file;
   try {
@@ -76,9 +113,41 @@ export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise
       position += bytesRead;
     }
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    if (text.length > 0 && !text.endsWith("\n")) return null;
-    const modelUsage: Record<string, ModelUsage> = Object.create(null);
-    const seen = new Set<string>();
+    return text.length === 0 || text.endsWith("\n") ? text : null;
+  } catch {
+    return null;
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+}
+
+/** Returns null if any part of the session tree cannot be read completely and trusted. */
+export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise<TranscriptUsage | null> {
+  if (!snapshot.readable || !snapshot.subagentsReadable) return null;
+  let childNames: string[];
+  try {
+    const stats = await stat(snapshot.subagentsDir);
+    if (!stats.isDirectory() ||
+        (snapshot.subagentsIdentity !== null && identity(stats) !== snapshot.subagentsIdentity)) return null;
+    childNames = (await readdir(snapshot.subagentsDir)).filter((name) => name.endsWith(".jsonl")).sort();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT" || snapshot.subagentsIdentity !== null) return null;
+    childNames = [];
+  }
+  const found = new Set(childNames);
+  if (Object.keys(snapshot.subagentFiles).some((name) => !found.has(name))) return null;
+  const files: FileSnapshot[] = [snapshot];
+  for (const name of childNames) {
+    files.push(snapshot.subagentFiles[name] ?? {
+      path: path.join(snapshot.subagentsDir, name), offset: 0, identity: null, readable: true,
+    });
+  }
+  const modelUsage: Record<string, ModelUsage> = Object.create(null);
+  const seen = new Set<string>();
+  // Main first, then subagent filenames in lexical order: deterministic first-wins.
+  for (const file of files) {
+    const text = await readDelta(file);
+    if (text === null) return null;
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
       let record: unknown;
@@ -103,12 +172,8 @@ export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise
       entry.requests++;
       modelUsage[message.model] = entry;
     }
-    return { modelUsage, requests: seen.size };
-  } catch {
-    return null;
-  } finally {
-    await file?.close().catch(() => undefined);
   }
+  return { modelUsage, requests: seen.size };
 }
 
 function finiteNumber(value: unknown): number | null {
