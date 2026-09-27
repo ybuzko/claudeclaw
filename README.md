@@ -99,6 +99,16 @@ Authorization: Bearer <contents of .claude/claudeclaw/web.token>
 
 Existing `/api/inject` users who configured `settings.apiToken` are unaffected; that fallback still works.
 
+The blocking `POST /api/inject` response includes `usage`. Its token counts and per-model
+`requests` come from assistant records appended to the Claude session transcript during the
+queued turn, deduplicated by `requestId` (first record wins). `basis: "transcript"` identifies
+those per-turn totals. If the transcript cannot be read, `basis: "result_json"` flags a
+potentially cumulative result JSON estimate; `requests: 0` then means the per-turn request count
+is unknown. `session` contains cumulative `costUsd`, `numTurns`, and `durationApiMs` when Claude
+reports them. Multiple transcript-backed attempts in one turn are summed; mixed or unavailable
+attempts retain the final readable estimate with `basis: "result_json"`. `usage` is `null` when
+no usage source is readable.
+
 ### v1.1.0 — Discord text-attachment truncation limit reduced
 
 Text attachments sent to the Discord bot are now truncated at **2,048 bytes** (previously 51,200). Payloads over that limit have `…[truncated]` appended silently; there is no config knob to restore the old limit.
