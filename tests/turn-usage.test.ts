@@ -31,7 +31,7 @@ it("sums only appended assistant requests, first occurrence wins across models",
         haiku: { inputTokens: 3, outputTokens: 9, cacheReadInputTokens: 5, cacheCreationInputTokens: 7, requests: 1 },
         sonnet: { inputTokens: 2, outputTokens: 4, cacheReadInputTokens: 6, cacheCreationInputTokens: 8, requests: 1 },
       },
-      basis: "transcript", session: { costUsd: 1.2, numTurns: 99, durationApiMs: 1234 },
+      basis: "transcript", malformedLines: 0, session: { costUsd: 1.2, numTurns: 99, durationApiMs: 1234 },
     });
     assert.match(file, /project-with-dots/);
   } finally {
@@ -62,8 +62,8 @@ it("includes old and new subagent files, dedupes across files, and isolates the 
     await writeFile(path.join(otherSession, "agent-other.jsonl"), childRecord("other", "wrong-session", 999));
 
     const snapshot = await snapshotTranscript(workspace, sessionId, env);
-    await appendFile(main, childRecord("r-main", "haiku", 10));
-    await appendFile(path.join(children, "agent-old.jsonl"), childRecord("r-old", "sonnet", 20));
+    await appendFile(main, childRecord("r-main", "haiku", 10) + "\0".repeat(1300) + "{torn}\n");
+    await appendFile(path.join(children, "agent-old.jsonl"), "\0".repeat(200) + "{torn}\n" + childRecord("r-old", "sonnet", 20));
     await writeFile(path.join(children, "agent-new.jsonl"),
       childRecord("r-main", "duplicate", 999) + childRecord("r-new", "opus", 30));
 
@@ -71,6 +71,7 @@ it("includes old and new subagent files, dedupes across files, and isolates the 
     const usage = usageFromAttempt(null, transcript, 25);
     assert.equal(usage?.basis, "transcript");
     assert.equal(usage?.requests, 3);
+    assert.equal(usage?.malformedLines, 2);
     assert.equal(usage?.outputTokens, 60);
     assert.equal(usage?.model, "opus");
     assert.deepEqual(Object.keys(usage!.modelUsage).sort(), ["haiku", "opus", "sonnet"]);
@@ -129,6 +130,7 @@ it("reports null without readable usage and flags result JSON fallback", async (
     assert.equal(usageFromAttempt(null, null, 10), null);
     const fallback = usageFromAttempt({ usage: { input_tokens: 9, output_tokens: 4 }, num_turns: 7 }, null, 10);
     assert.equal(fallback?.basis, "result_json");
+    assert.equal(fallback?.malformedLines, null);
     assert.equal(fallback?.requests, 0);
     assert.equal(fallback?.session.numTurns, 7);
   } finally {
@@ -139,15 +141,18 @@ it("reports null without readable usage and flags result JSON fallback", async (
 it("sums transcript retries and keeps cumulative fallback estimates separate", () => {
   const first = usageFromAttempt({ num_turns: 3 }, {
     requests: 1,
+    malformedLines: 1,
     modelUsage: { haiku: { inputTokens: 2, outputTokens: 3, cacheReadInputTokens: 4, cacheCreationInputTokens: 5, requests: 1 } },
   }, 10)!;
   const second = usageFromAttempt({ num_turns: 4 }, {
     requests: 1,
+    malformedLines: 2,
     modelUsage: { sonnet: { inputTokens: 7, outputTokens: 11, cacheReadInputTokens: 13, cacheCreationInputTokens: 17, requests: 1 } },
   }, 20)!;
   const combined = combineAttemptUsages([first, second])!;
   assert.equal(combined.basis, "transcript");
   assert.equal(combined.requests, 2);
+  assert.equal(combined.malformedLines, 3);
   assert.equal(combined.outputTokens, 14);
   assert.equal(combined.durationMs, 30);
   assert.equal(combined.model, "sonnet");
@@ -156,8 +161,10 @@ it("sums transcript retries and keeps cumulative fallback estimates separate", (
   const fallback = usageFromAttempt({ usage: { output_tokens: 100 }, num_turns: 99 }, null, 30)!;
   const mixed = combineAttemptUsages([first, fallback])!;
   assert.equal(mixed.basis, "result_json");
+  assert.equal(mixed.malformedLines, null);
   assert.equal(mixed.outputTokens, 100, "cumulative JSON must not be added to transcript totals");
   assert.equal(combineAttemptUsages([null, second])?.basis, "result_json");
+  assert.equal(combineAttemptUsages([null, second])?.malformedLines, null);
   const timedOutCompact = combineAttemptUsages([first, null]);
   assert.equal(timedOutCompact?.basis, "result_json");
   assert.deepEqual(timedOutCompact?.session, { costUsd: null, numTurns: null, durationApiMs: null });

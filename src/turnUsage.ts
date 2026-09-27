@@ -18,6 +18,8 @@ export type TurnUsage = ModelUsage & {
   model: string | null;
   modelUsage: Record<string, ModelUsage>;
   basis: "transcript" | "result_json";
+  /** Complete unreadable JSONL lines skipped; null when transcript accounting is unavailable. */
+  malformedLines: number | null;
   session: { costUsd: number | null; numTurns: number | null; durationApiMs: number | null };
 };
 
@@ -28,7 +30,7 @@ export type TranscriptSnapshot = FileSnapshot & {
   subagentsReadable: boolean;
   subagentFiles: Record<string, FileSnapshot>;
 };
-export type TranscriptUsage = { modelUsage: Record<string, ModelUsage>; requests: number };
+export type TranscriptUsage = { modelUsage: Record<string, ModelUsage>; requests: number; malformedLines: number };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -96,7 +98,7 @@ export async function snapshotTranscript(workspace: string, sessionId: string, e
   return { ...main, subagentsDir, subagentsIdentity, subagentsReadable, subagentFiles };
 }
 
-async function readDelta(snapshot: FileSnapshot): Promise<string | null> {
+async function readDelta(snapshot: FileSnapshot): Promise<Buffer | null> {
   if (!snapshot.readable) return null;
   let file;
   try {
@@ -112,8 +114,8 @@ async function readDelta(snapshot: FileSnapshot): Promise<string | null> {
       if (bytesRead === 0) return null;
       position += bytesRead;
     }
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return text.length === 0 || text.endsWith("\n") ? text : null;
+    // A missing final LF is still an in-progress write, not a complete bad line.
+    return bytes.length === 0 || bytes[bytes.length - 1] === 10 ? bytes : null;
   } catch {
     return null;
   } finally {
@@ -144,14 +146,26 @@ export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise
   }
   const modelUsage: Record<string, ModelUsage> = Object.create(null);
   const seen = new Set<string>();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let malformedLines = 0;
   // Main first, then subagent filenames in lexical order: deterministic first-wins.
   for (const file of files) {
-    const text = await readDelta(file);
-    if (text === null) return null;
-    for (const line of text.split("\n")) {
+    const bytes = await readDelta(file);
+    if (bytes === null) return null;
+    for (let start = 0; start < bytes.length;) {
+      const end = bytes.indexOf(10, start);
+      let line: string;
+      try {
+        line = decoder.decode(bytes.subarray(start, end));
+      } catch {
+        malformedLines++;
+        start = end + 1;
+        continue;
+      }
+      start = end + 1;
       if (!line.trim()) continue;
       let record: unknown;
-      try { record = JSON.parse(line); } catch { return null; }
+      try { record = JSON.parse(line); } catch { malformedLines++; continue; }
       if (!isRecord(record) || !isRecord(record.message) || record.message.role !== "assistant") continue;
       const message = record.message;
       if (typeof record.requestId !== "string" || !record.requestId ||
@@ -173,7 +187,7 @@ export async function readTranscriptUsage(snapshot: TranscriptSnapshot): Promise
       modelUsage[message.model] = entry;
     }
   }
-  return { modelUsage, requests: seen.size };
+  return { modelUsage, requests: seen.size, malformedLines };
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -220,6 +234,7 @@ export function usageFromAttempt(result: Record<string, unknown> | null, transcr
     model,
     modelUsage,
     basis: transcript ? "transcript" : "result_json",
+    malformedLines: transcript?.malformedLines ?? null,
     session: {
       costUsd: finiteNumber(result?.total_cost_usd),
       numTurns: finiteNumber(result?.num_turns),
@@ -238,15 +253,18 @@ export function combineAttemptUsages(attempts: Array<TurnUsage | null>): TurnUsa
     return {
       ...last,
       basis: "result_json",
+      malformedLines: null,
       session: attempts[attempts.length - 1]?.session ?? { costUsd: null, numTurns: null, durationApiMs: null },
     };
   }
   const modelUsage: Record<string, ModelUsage> = Object.create(null);
   let durationMs = 0;
   let requests = 0;
+  let malformedLines = 0;
   for (const usage of available) {
     durationMs += usage.durationMs;
     requests += usage.requests;
+    malformedLines += usage.malformedLines ?? 0;
     for (const [name, entry] of Object.entries(usage.modelUsage)) {
       const target = modelUsage[name] ?? { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, requests: 0 };
       target.inputTokens += entry.inputTokens;
@@ -267,5 +285,5 @@ export function combineAttemptUsages(attempts: Array<TurnUsage | null>): TurnUsa
     totals.cacheCreationInputTokens += entry.cacheCreationInputTokens;
     if (entry.outputTokens > best) { best = entry.outputTokens; model = name; }
   }
-  return { provider: "anthropic", ...totals, requests, durationMs, model, modelUsage, basis: "transcript", session: last.session };
+  return { provider: "anthropic", ...totals, requests, durationMs, model, modelUsage, basis: "transcript", malformedLines, session: last.session };
 }

@@ -37,9 +37,10 @@ const record = (requestId, model, output) => JSON.stringify({
     usage: { input_tokens: 1, output_tokens: output,
       cache_read_input_tokens: 2, cache_creation_input_tokens: 3 } },
 }) + "\\n";
-appendFileSync(join(base, sid + ".jsonl"), record("main-" + turn, "haiku", 9 + turn));
+const malformed = turn === 1 ? "\\0".repeat(1300) + "{torn}\\n" : "";
+appendFileSync(join(base, sid + ".jsonl"), record("main-" + turn, "haiku", 9 + turn) + malformed);
 appendFileSync(join(children, "agent-existing.jsonl"),
-  record("main-" + turn, "duplicate", 999) + record("child-" + turn, "opus", 19 + turn));
+  record("main-" + turn, "duplicate", 999) + malformed + record("child-" + turn, "opus", 19 + turn));
 if (turn === 2) writeFileSync(join(children, "agent-new.jsonl"), record("new-2", "sonnet", 7));
 appendFileSync(join(process.cwd(), "cli-calls.jsonl"), JSON.stringify({
   turn, resume, resumedId: resume ? process.argv[resumeAt + 1] : null,
@@ -95,6 +96,7 @@ await Bun.write("responses.json", JSON.stringify(responses));
     assert.deepEqual(responses.map((r: any) => r.sessionId), [sessionId, sessionId]);
     assert.deepEqual(responses.map((r: any) => r.result), ["turn 1", "turn 2"]);
     assert.deepEqual(responses.map((r: any) => r.usage?.basis), ["transcript", "transcript"]);
+    assert.deepEqual(responses.map((r: any) => r.usage?.malformedLines), [2, 0]);
     assert.deepEqual(responses.map((r: any) => r.usage?.requests), [2, 3]);
     assert.deepEqual(responses.map((r: any) => r.usage?.outputTokens), [30, 39]);
     assert.deepEqual(responses.map((r: any) => Object.keys(r.usage?.modelUsage ?? {}).sort()), [

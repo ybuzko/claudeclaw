@@ -101,6 +101,7 @@ describe("handleInject sessionId", () => {
       durationMs: 12, model: "haiku",
       modelUsage: { haiku: { inputTokens: 3, outputTokens: 9, cacheReadInputTokens: 5, cacheCreationInputTokens: 7, requests: 1 } },
       basis: "transcript" as const,
+      malformedLines: 0,
       session: { costUsd: 1.2, numTurns: 2, durationApiMs: 10 },
     };
     const { deps } = makeDeps({ run: async () => ({ stdout: "ok", exitCode: 0, usage }) });
