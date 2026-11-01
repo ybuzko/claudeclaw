@@ -390,6 +390,10 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
   const childEnv: Record<string, string> = { ...baseEnv };
   const normalizedModel = model.trim().toLowerCase();
 
+  // Read fresh like resolveTimeoutMs, so a settings.json edit applies to the next run.
+  const backgroundWait = getSettings().timeouts.backgroundWait;
+  if (backgroundWait) childEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = String(backgroundWait * 60_000);
+
   if (api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = api.trim();
 
   if (normalizedModel === "glm") {
