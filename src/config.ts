@@ -165,6 +165,11 @@ export interface TimeoutsConfig {
   job: number;
   /** Max minutes for all other subprocesses (bootstrap, trigger, etc). Default: 5 min. */
   default: number;
+  /**
+   * Max minutes `claude -p` waits for background subagents after a turn ends before
+   * killing them (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS). Unset: Claude's own default (10 min).
+   */
+  backgroundWait?: number;
 }
 
 export interface Settings {
@@ -308,7 +313,7 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
-function parseSettings(
+export function parseSettings(
   raw: Record<string, any>,
   discordUserIds?: string[],
 ): Settings {
@@ -417,6 +422,9 @@ function parseSettings(
       heartbeat: Number.isFinite(raw.timeouts?.heartbeat) && Number(raw.timeouts.heartbeat) > 0 ? Number(raw.timeouts.heartbeat) : 15,
       job: Number.isFinite(raw.timeouts?.job) && Number(raw.timeouts.job) > 0 ? Number(raw.timeouts.job) : 30,
       default: Number.isFinite(raw.timeouts?.default) && Number(raw.timeouts.default) > 0 ? Number(raw.timeouts.default) : 5,
+      ...(Number.isFinite(raw.timeouts?.backgroundWait) && Number(raw.timeouts.backgroundWait) > 0
+        ? { backgroundWait: Number(raw.timeouts.backgroundWait) }
+        : {}),
     },
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
