@@ -8,6 +8,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { findSessionJsonlPath } from "../sessionFiles";
@@ -545,6 +546,58 @@ function modelKey(chatId: number, threadId?: number): string {
 // in flight. Opt-in: the default is to tell the user to wait, which keeps them
 // from stacking up work they expected to land immediately.
 const queueEnabledTopics = new Set<string>();
+
+// The toggles above survive restarts, like /mode does in permission-mode.json:
+// a topic pinned to a cheap model must not silently fall back to the default.
+// Kept out of settings.json, which is hand-edited and fleet-managed.
+const TELEGRAM_STATE_FILE = join(process.cwd(), ".claude", "claudeclaw", "telegram-state.json");
+
+export interface TelegramState {
+  verboseChats: number[];
+  chatModels: Record<string, string>;
+  queueEnabledTopics: string[];
+}
+
+/** Validate a parsed telegram-state.json, dropping anything malformed. */
+export function parseTelegramState(raw: unknown): TelegramState {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const models = r.chatModels && typeof r.chatModels === "object" ? r.chatModels as Record<string, unknown> : {};
+  return {
+    verboseChats: Array.isArray(r.verboseChats) ? r.verboseChats.filter((v): v is number => Number.isSafeInteger(v)) : [],
+    chatModels: Object.fromEntries(Object.entries(models).filter((e): e is [string, string] => typeof e[1] === "string" && e[1].length > 0)),
+    queueEnabledTopics: Array.isArray(r.queueEnabledTopics) ? r.queueEnabledTopics.filter((v): v is string => typeof v === "string") : [],
+  };
+}
+
+function loadTelegramState(): void {
+  let state: TelegramState;
+  try {
+    state = parseTelegramState(JSON.parse(readFileSync(TELEGRAM_STATE_FILE, "utf8")));
+  } catch {
+    return; // first run, or unreadable: start from defaults
+  }
+  for (const id of state.verboseChats) verboseChats.add(id);
+  for (const [key, model] of Object.entries(state.chatModels)) chatModels.set(key, model);
+  for (const key of state.queueEnabledTopics) queueEnabledTopics.add(key);
+}
+
+function persistTelegramState(): void {
+  const state: TelegramState = {
+    verboseChats: [...verboseChats],
+    chatModels: Object.fromEntries(chatModels),
+    queueEnabledTopics: [...queueEnabledTopics],
+  };
+  try {
+    mkdirSync(join(process.cwd(), ".claude", "claudeclaw"), { recursive: true });
+    const tmp = `${TELEGRAM_STATE_FILE}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+    renameSync(tmp, TELEGRAM_STATE_FILE);
+  } catch (err) {
+    console.error("[Telegram] Failed to persist chat state:", err);
+  }
+}
+
+loadTelegramState();
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
@@ -1286,9 +1339,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   if (command === "/verbose") {
     if (verboseChats.has(chatId)) {
       verboseChats.delete(chatId);
+      persistTelegramState();
       await sendMessage(config.token, chatId, "Verbose mode off.", threadId);
     } else {
       verboseChats.add(chatId);
+      persistTelegramState();
       await sendMessage(config.token, chatId, "Verbose mode on — tool calls will be shown.", threadId);
     }
     return;
@@ -1326,24 +1381,28 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/modelhaiku") {
     chatModels.set(modelKey(chatId, threadId), MODEL_HAIKU);
+    persistTelegramState();
     await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelsonnet") {
     chatModels.set(modelKey(chatId, threadId), MODEL_SONNET);
+    persistTelegramState();
     await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelopus") {
     chatModels.set(modelKey(chatId, threadId), MODEL_OPUS);
+    persistTelegramState();
     await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses. (this topic only)", threadId);
     return;
   }
 
   if (command === "/modelfable") {
     chatModels.set(modelKey(chatId, threadId), MODEL_FABLE);
+    persistTelegramState();
     await sendMessage(config.token, chatId, "📖 Switched to Fable 5.1. (this topic only)", threadId);
     return;
   }
@@ -1355,12 +1414,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       return;
     }
     chatModels.set(modelKey(chatId, threadId), modelId);
+    persistTelegramState();
     await sendMessage(config.token, chatId, `📊 Switched to \`${modelId}\`. (this topic only)`, threadId);
     return;
   }
 
   if (command === "/modeldefault") {
     chatModels.delete(modelKey(chatId, threadId));
+    persistTelegramState();
     const settings = getSettings();
     const defaultModel = settings.model || "default";
     await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel} (this topic only)`, threadId);
@@ -1378,12 +1439,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/queueon") {
     queueEnabledTopics.add(modelKey(chatId, threadId));
+    persistTelegramState();
     await sendMessage(config.token, chatId, "📥 Queue on — messages sent while I'm working will be queued and handled in order. (this topic only)", threadId);
     return;
   }
 
   if (command === "/queueoff") {
     queueEnabledTopics.delete(modelKey(chatId, threadId));
+    persistTelegramState();
     await sendMessage(config.token, chatId, "⏸ Queue off — messages sent while I'm working will get a busy notice. (this topic only)", threadId);
     return;
   }
