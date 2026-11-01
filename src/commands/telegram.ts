@@ -512,6 +512,11 @@ const chatModels = new Map<string, string>();
 function modelKey(chatId: number, threadId?: number): string {
   return threadId ? `${chatId}:${threadId}` : String(chatId);
 }
+
+// Topics that queue incoming messages instead of rejecting them while a run is
+// in flight. Opt-in: the default is to tell the user to wait, which keeps them
+// from stacking up work they expected to land immediately.
+const queueEnabledTopics = new Set<string>();
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
@@ -1317,6 +1322,27 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/queue") {
+    const enabled = queueEnabledTopics.has(modelKey(chatId, threadId));
+    const state = enabled
+      ? "📥 Queue is **on** — messages sent while a run is in flight are queued and handled in order."
+      : "⏸ Queue is **off** — messages sent while a run is in flight are rejected with a busy notice.";
+    await sendMessage(config.token, chatId, `${state}\n\n• /queueon - queue incoming messages\n• /queueoff - reject while busy (default)\n\nScope: this topic only.`, threadId);
+    return;
+  }
+
+  if (command === "/queueon") {
+    queueEnabledTopics.add(modelKey(chatId, threadId));
+    await sendMessage(config.token, chatId, "📥 Queue on — messages sent while I'm working will be queued and handled in order. (this topic only)", threadId);
+    return;
+  }
+
+  if (command === "/queueoff") {
+    queueEnabledTopics.delete(modelKey(chatId, threadId));
+    await sendMessage(config.token, chatId, "⏸ Queue off — messages sent while I'm working will get a busy notice. (this topic only)", threadId);
+    return;
+  }
+
   if (command === "/fork") {
     const forkPrompt = text.replace(/^\/fork\s*/i, "").trim();
     if (!forkPrompt) {
@@ -1579,7 +1605,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
-    if (busy) {
+    if (busy && !queueEnabledTopics.has(modelKey(chatId, threadId))) {
       await sendMessage(config.token, chatId, "Claude is busy in this topic — try again in a moment, or use /fork for a quick parallel task.", threadId);
       return;
     } else {
@@ -1842,6 +1868,9 @@ async function registerBotCommands(token: string): Promise<void> {
       // Mode toggles
       { command: "mode", description: "🔐 Get or set Claude permission mode" },
       { command: "verbose", description: "🔧 Toggle tool call display" },
+      { command: "queue", description: "📥 Show message queueing for this topic" },
+      { command: "queueon", description: "📥 Queue messages sent while busy" },
+      { command: "queueoff", description: "⏸ Reject messages sent while busy" },
       // Control
       { command: "fork", description: "🍴 Run parallel task" },
       { command: "kill", description: "⛔ Stop current agent" },
@@ -1867,7 +1896,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "usage", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "usage", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modelfable", "modelid", "modelids", "modeldefault", "queue", "queueon", "queueoff"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
