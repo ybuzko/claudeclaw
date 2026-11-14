@@ -109,9 +109,20 @@ const COMPACT_TIMEOUT_ENABLED = true;
 function cleanSpawnEnv(): Record<string, string> {
   const stripped = new Set([
     "CLAUDECODE",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
   ]);
+  // Only strip CLAUDE_CODE_OAUTH_TOKEN when the daemon itself was spawned from
+  // inside a Claude Code session (CLAUDECODE=1 marks nesting) — in that case the
+  // inherited token is the parent's 8h session access token with no refresh
+  // counterpart, so letting the CLI fall back to the credential store is right.
+  // When the daemon is launched directly from systemd with the token set via
+  // EnvironmentFile, CLAUDECODE is unset and the token is a long-lived
+  // `sk-ant-oat01-...` from `claude setup-token`, meant for unattended use —
+  // keep it so child `claude` processes can authenticate after the credential
+  // store's OAuth session expires.
+  if (process.env.CLAUDECODE === "1") {
+    stripped.add("CLAUDE_CODE_OAUTH_TOKEN");
+  }
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (stripped.has(key)) continue;

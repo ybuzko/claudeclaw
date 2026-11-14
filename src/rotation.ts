@@ -14,14 +14,17 @@ const SUMMARY_PROMPT_FILE = join(PROMPTS_DIR, "SUMMARY.md");
 // Mirror of the stripping done in runner.ts cleanSpawnEnv().
 const STRIPPED_ENV_KEYS = new Set([
   "CLAUDECODE",
-  "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
 ]);
 
 function cleanEnv(): Record<string, string> {
+  // Same rule as runner.ts cleanSpawnEnv(): keep a setup-token passed in by
+  // systemd; strip only a parent Claude Code session's token (CLAUDECODE=1).
+  const stripToken = process.env.CLAUDECODE === "1";
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (STRIPPED_ENV_KEYS.has(key)) continue;
+    if (stripToken && key === "CLAUDE_CODE_OAUTH_TOKEN") continue;
     if (typeof value === "string") out[key] = value;
   }
   return out;
