@@ -1790,7 +1790,8 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
       const { cleanedText: afterVideo, videoPaths } = extractSendVideoDirectives(afterFile);
       const { cleanedText, buttonRows } = extractButtonsDirective(afterVideo);
-      if (reactionEmoji) {
+      // Skip when it matches the ack: re-setting an identical reaction returns REACTION_INVALID.
+      if (reactionEmoji && reactionEmoji !== ACK_REACTION) {
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
