@@ -473,6 +473,22 @@ function isChatCoolingDown(chatId: number): boolean {
 // Reaction set by the daemon the moment a message is accepted, before Claude starts.
 // A [react:X] directive in the final reply replaces it (setMessageReaction overwrites).
 const ACK_REACTION = "👀";
+// Replaces the ack when a turn finishes without a [react:] directive / with an error.
+const DONE_REACTION = "👍";
+const ERROR_REACTION = "😢";
+
+// Telegram's fixed set of emoji a bot may react with (ReactionTypeEmoji). Anything else
+// returns 400 REACTION_INVALID. Compared with U+FE0F variation selectors stripped.
+const ALLOWED_REACTIONS = new Set([
+  "👍","👎","❤","🔥","🥰","👏","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","🤮","💩","🙏","👌",
+  "🕊","🤡","🥱","🥴","😍","🐳","❤‍🔥","🌚","🌭","💯","🤣","⚡","🍌","🏆","💔","🤨","😐","🍓",
+  "🍾","💋","🖕","😈","😴","😭","🤓","👻","👨‍💻","👀","🎃","🙈","😇","😨","🤝","✍","🤗","🫡",
+  "🎅","🎄","☃","💅","🤪","🗿","🆒","💘","🙉","🦄","😘","💊","🙊","😎","👾","🤷‍♂","🤷","🤷‍♀","😡",
+]);
+function normalizeReaction(emoji: string): string | null {
+  const e = emoji.trim().replace(/\uFE0F/g, "");
+  return ALLOWED_REACTIONS.has(e) ? e : null;
+}
 
 // Telegram's per-message character limit. editMessageText cannot exceed it and has
 // no multi-message form, so anything longer has to be sent, not edited.
@@ -846,6 +862,9 @@ async function sendVoiceMessage(token: string, chatId: number, voicePath: string
 }
 
 async function sendReaction(token: string, chatId: number, messageId: number, emoji: string): Promise<void> {
+  const valid = normalizeReaction(emoji);
+  if (!valid) console.warn(`[Telegram] reaction ${emoji} not allowed by Telegram; using ${DONE_REACTION}`);
+  emoji = valid ?? DONE_REACTION;
   await callApi(token, "setMessageReaction", {
     chat_id: chatId,
     message_id: messageId,
@@ -1689,6 +1708,18 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
   }
 
+  // Swap the ack on every acked part for the turn's outcome. No-op when unchanged.
+  const finalizeReactions = async (emoji: string): Promise<void> => {
+    if (rejectAsBusy) return;
+    const finalEmoji = normalizeReaction(emoji) ?? DONE_REACTION;
+    if (finalEmoji === ACK_REACTION) return;
+    await Promise.all([message.message_id, ...(message.mergedMessageIds ?? [])].map((id) =>
+      sendReaction(config.token, chatId, id, finalEmoji).catch((err) => {
+        console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
+      })
+    ));
+  };
+
   // Keep typing indicator alive while queued/running
   const typingInterval = setInterval(() => sendTyping(config.token, chatId, threadId), 4000);
 
@@ -1861,6 +1892,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       } else {
         await sendMessage(config.token, chatId, errorMsg, threadId);
       }
+      await finalizeReactions(ERROR_REACTION);
     } else {
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
       const hadVoiceDirective = /\[voice:\/[^\]\r\n]+\]/i.test(afterReact);
@@ -1868,12 +1900,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
       const { cleanedText: afterVideo, videoPaths } = extractSendVideoDirectives(afterFile);
       const { cleanedText, buttonRows } = extractButtonsDirective(afterVideo);
-      // Skip when it matches the ack: re-setting an identical reaction returns REACTION_INVALID.
-      if (reactionEmoji && reactionEmoji !== ACK_REACTION) {
-        await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
-          console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
-        });
-      }
+      await finalizeReactions(reactionEmoji ?? DONE_REACTION);
       for (const vp of voicePaths) {
         try {
           await sendVoiceMessage(config.token, chatId, vp, threadId);
@@ -1963,6 +1990,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Telegram] Error for ${label}: ${errMsg}`);
     await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
+    await finalizeReactions(ERROR_REACTION);
   } finally {
     clearInterval(typingInterval);
     if (!rejectAsBusy) {
