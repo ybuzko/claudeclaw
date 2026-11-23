@@ -437,10 +437,40 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
     signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
-    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+    let detail = "";
+    try {
+      const err = (await res.json()) as { description?: string; parameters?: { retry_after?: number } };
+      detail = err.description ? ` — ${err.description}` : "";
+      const retryAfter = err.parameters?.retry_after;
+      if (res.status === 429 && typeof retryAfter === "number" && typeof body?.chat_id === "number") {
+        noteChatCooldown(body.chat_id as number, retryAfter);
+      }
+    } catch {}
+    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}${detail}`);
   }
   return (await res.json()) as T;
 }
+
+// Per-chat flood-control cooldowns. Telegram answers 429 with retry_after when a chat's
+// budget is spent (groups: ~20 outbound actions/min, shared by sends, edits and typing).
+// Cosmetic calls (typing, stream-preview edits) skip a chat while it is cooling down so
+// they stop burning the budget the final reply needs.
+const chatCooldownUntil = new Map<number, number>();
+function noteChatCooldown(chatId: number, retryAfterSec: number): void {
+  const until = Date.now() + retryAfterSec * 1000;
+  if (until > (chatCooldownUntil.get(chatId) ?? 0)) chatCooldownUntil.set(chatId, until);
+  console.warn(`[Telegram] 429 flood control in chat ${chatId}: retry after ${retryAfterSec}s`);
+}
+function isChatCoolingDown(chatId: number): boolean {
+  const until = chatCooldownUntil.get(chatId);
+  if (!until) return false;
+  if (Date.now() >= until) { chatCooldownUntil.delete(chatId); return false; }
+  return true;
+}
+
+// Reaction set by the daemon the moment a message is accepted, before Claude starts.
+// A [react:X] directive in the final reply replaces it (setMessageReaction overwrites).
+const ACK_REACTION = "👀";
 
 // Telegram's per-message character limit. editMessageText cannot exceed it and has
 // no multi-message form, so anything longer has to be sent, not edited.
@@ -470,11 +500,14 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
 }
 
 async function sendTyping(token: string, chatId: number, threadId?: number): Promise<void> {
+  if (isChatCoolingDown(chatId)) return;
   await callApi(token, "sendChatAction", {
     chat_id: chatId,
     action: "typing",
     ...(threadId ? { message_thread_id: threadId } : {}),
-  }).catch(() => {});
+  }).catch((err) => {
+    console.warn(`[Telegram] typing failed in chat ${chatId}${threadId ? `/${threadId}` : ""}: ${err instanceof Error ? err.message : err}`);
+  });
 }
 
 async function sendDocumentToChat(
@@ -615,7 +648,9 @@ function makeStreamCallback(
   threadId: number | undefined,
   options: { intervalMs?: number; verbose?: boolean } = {}
 ): { onChunk: (text: string) => void; onToolEvent: (line: string) => void; waitForStreamMsg: () => Promise<{ msgId: number | null; hadToolLines: boolean }> } {
-  const { intervalMs = 500, verbose = false } = options;
+  // Groups share a ~20 actions/min budget across sends, edits and typing; a 500ms edit
+  // cadence blows through it and starves the typing indicator. DMs allow ~1/s.
+  const { intervalMs = chatId < 0 ? 3000 : 1000, verbose = false } = options;
   let textAcc = "";
   const toolLines: string[] = [];
   let lastSentAt = 0;
@@ -653,6 +688,7 @@ function makeStreamCallback(
       display = lines.length > 30 ? `[...]\n${lines.slice(-30).join("\n")}` : textAcc;
     }
     if (!display) return;
+    if (isChatCoolingDown(chatId)) return;
     callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: streamMsgId,
@@ -677,6 +713,9 @@ function makeStreamCallback(
           );
           if (res.ok) {
             streamMsgId = res.result.message_id;
+            // Posting a message clears the typing indicator; restore it right away
+            // instead of waiting up to 4s for the next keepalive tick.
+            void sendTyping(token, chatId, threadId);
             editStream();
           }
         } catch {}
@@ -1562,6 +1601,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const resetStr = resetAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
     await sendMessage(config.token, chatId, `Usage limit reached. Resets at ${resetStr} UTC. I'll be back after that.`, threadId);
     return;
+  }
+
+  // Ack immediately, before downloads/transcription/Claude. Skip when this topic is
+  // busy without queueing: that message gets a busy notice instead of a run.
+  if (!isThreadBusy(sessionKey) || queueEnabledTopics.has(modelKey(chatId, threadId))) {
+    void sendReaction(config.token, chatId, message.message_id, ACK_REACTION).catch((err) => {
+      console.warn(`[Telegram] ack reaction failed for ${label}: ${err instanceof Error ? err.message : err}`);
+    });
   }
 
   // Keep typing indicator alive while queued/running
