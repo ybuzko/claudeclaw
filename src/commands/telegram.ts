@@ -89,6 +89,8 @@ interface TelegramUser {
 
 interface TelegramMessage {
   message_id: number;
+  /** Set by the split-message coalescer: ids of the later parts merged into this one. */
+  mergedMessageIds?: number[];
   from?: TelegramUser;
   reply_to_message?: { message_id?: number; from?: TelegramUser; text?: string; caption?: string };
   quote?: { text?: string };
@@ -1191,6 +1193,73 @@ function getTelegramSessionKey(
 
 // --- Message handler ---
 
+// sessionKey -> messages accepted for a run that the runner hasn't counted yet.
+const topicClaims = new Map<string, number>();
+
+// --- Split-message coalescing ---
+// Telegram clients split pastes over 4096 chars into consecutive messages that arrive
+// within about a second. A long plain-text message waits briefly for continuation parts
+// from the same sender in the same topic; the parts become one prompt. Short messages
+// are dispatched immediately, so normal chat pays no latency.
+const SPLIT_MIN_LEN = 3000;
+const SPLIT_WAIT_MS = 2000;
+interface PendingSplit { first: TelegramMessage; parts: string[]; ids: number[]; timer: ReturnType<typeof setTimeout> }
+const pendingSplits = new Map<string, PendingSplit>();
+
+function splitKey(m: TelegramMessage): string {
+  return `${m.chat.id}:${m.message_thread_id ?? 0}:${m.from?.id ?? 0}`;
+}
+
+function isPlainText(m: TelegramMessage): boolean {
+  if (!m.text || m.text.startsWith("/")) return false;
+  return !(m.photo || m.document || m.voice || m.audio || m.video || m.animation || m.sticker || m.video_note);
+}
+
+function runHandler(m: TelegramMessage): void {
+  handleMessage(m).catch((err) => {
+    console.error(`[Telegram] Unhandled: ${err}`);
+  });
+}
+
+function flushSplit(key: string): void {
+  const p = pendingSplits.get(key);
+  if (!p) return;
+  pendingSplits.delete(key);
+  clearTimeout(p.timer);
+  if (p.ids.length > 0) {
+    console.log(`[Telegram] merged ${p.ids.length + 1} split parts (${p.parts.join("").length} chars)`);
+  }
+  runHandler({ ...p.first, text: p.parts.join("\n"), mergedMessageIds: p.ids });
+}
+
+function dispatchIncoming(m: TelegramMessage): void {
+  const key = splitKey(m);
+  const pending = pendingSplits.get(key);
+  if (pending) {
+    if (isPlainText(m)) {
+      pending.parts.push(m.text!);
+      pending.ids.push(m.message_id);
+      clearTimeout(pending.timer);
+      // Another near-limit part means more may follow; otherwise this was the tail.
+      if (m.text!.length >= SPLIT_MIN_LEN) {
+        pending.timer = setTimeout(() => flushSplit(key), SPLIT_WAIT_MS);
+      } else {
+        flushSplit(key);
+      }
+      return;
+    }
+    flushSplit(key);
+  }
+  if (isPlainText(m) && m.text!.length >= SPLIT_MIN_LEN) {
+    pendingSplits.set(key, {
+      first: m, parts: [m.text!], ids: [],
+      timer: setTimeout(() => flushSplit(key), SPLIT_WAIT_MS),
+    });
+    return;
+  }
+  runHandler(m);
+}
+
 async function handleMessage(message: TelegramMessage): Promise<void> {
   const config = getSettings().telegram;
   const userId = message.from?.id;
@@ -1603,12 +1672,21 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-  // Ack immediately, before downloads/transcription/Claude. Skip when this topic is
-  // busy without queueing: that message gets a busy notice instead of a run.
-  if (!isThreadBusy(sessionKey) || queueEnabledTopics.has(modelKey(chatId, threadId))) {
-    void sendReaction(config.token, chatId, message.message_id, ACK_REACTION).catch((err) => {
-      console.warn(`[Telegram] ack reaction failed for ${label}: ${err instanceof Error ? err.message : err}`);
-    });
+  // Decide busy-vs-run and claim the topic in one synchronous step. The runner only
+  // counts a run once runUserMessage starts, which is after downloads/transcription;
+  // without the claim, a second message landing in that window passes the busy check
+  // (and gets acked) before being rejected.
+  const busyAtArrival = isThreadBusy(sessionKey) || (topicClaims.get(sessionKey) ?? 0) > 0;
+  const rejectAsBusy = busyAtArrival && !queueEnabledTopics.has(modelKey(chatId, threadId));
+  if (!rejectAsBusy) {
+    topicClaims.set(sessionKey, (topicClaims.get(sessionKey) ?? 0) + 1);
+    // Ack immediately, before downloads/transcription/Claude — every part that
+    // actually reaches the model, including split parts merged into this one.
+    for (const id of [message.message_id, ...(message.mergedMessageIds ?? [])]) {
+      void sendReaction(config.token, chatId, id, ACK_REACTION).catch((err) => {
+        console.warn(`[Telegram] ack reaction failed for ${label}: ${err instanceof Error ? err.message : err}`);
+      });
+    }
   }
 
   // Keep typing indicator alive while queued/running
@@ -1754,7 +1832,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const prefixedPrompt = promptParts.join("\n");
     // Per-topic: threads run in parallel (runner enqueues per threadId), so only a
     // run in THIS thread should block. A busy topic must not gate a different one.
-    const busy = isThreadBusy(sessionKey);
+    const busy = rejectAsBusy;
     const verbose = verboseChats.has(chatId);
     const modelOverride = chatModels.get(modelKey(chatId, threadId));
     let result;
@@ -1887,6 +1965,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
   } finally {
     clearInterval(typingInterval);
+    if (!rejectAsBusy) {
+      const n = (topicClaims.get(sessionKey) ?? 1) - 1;
+      if (n > 0) topicClaims.set(sessionKey, n); else topicClaims.delete(sessionKey);
+    }
   }
 }
 
@@ -2131,9 +2213,7 @@ async function poll(generation: number): Promise<void> {
           update.edited_channel_post,
         ].filter((m): m is TelegramMessage => Boolean(m));
         for (const incoming of incomingMessages) {
-          handleMessage(incoming).catch((err) => {
-            console.error(`[Telegram] Unhandled: ${err}`);
-          });
+          dispatchIncoming(incoming);
         }
         if (update.my_chat_member) {
           handleMyChatMember(update.my_chat_member).catch((err) => {
