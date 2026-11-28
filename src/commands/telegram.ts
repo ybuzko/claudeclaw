@@ -652,7 +652,10 @@ loadTelegramState();
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
-const MODEL_FABLE = "claude-fable-5-1";
+// "fable" is a Claude Code alias that resolves to the newest Fable release, so
+// /modelfable tracks new versions without a code change. Pinned IDs: /modelids.
+const MODEL_FABLE = "fable";
+const MODEL_FABLE_IDS = ["claude-fable-5-2", "claude-fable-5-1"];
 
 /**
  * Build a streaming callback using editMessageText.
@@ -1480,11 +1483,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const currentModel = chatModels.get(modelKey(chatId, threadId));
     const settings = getSettings();
     const defaultModel = settings.model || "default";
-    const optionsList = "\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modelfable - Fable 5.1\n• /modelid <id> - Any model ID (see /modelids)\n• /modeldefault - Use config default\n\nScope: this topic only.";
+    const optionsList = "\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modelfable - Fable (latest)\n• /modelid <id> - Any model ID (see /modelids)\n• /modeldefault - Use config default\n\nScope: this topic only.";
     if (!currentModel) {
       await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)${optionsList}`, threadId);
     } else {
-      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel === MODEL_FABLE ? "Fable 5.1" : currentModel;
+      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel === MODEL_FABLE ? "Fable (latest)" : currentModel;
       await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**${optionsList}`, threadId);
     }
     return;
@@ -1497,7 +1500,8 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       `• Haiku: \`${MODEL_HAIKU}\``,
       `• Sonnet: \`${MODEL_SONNET}\``,
       `• Opus: \`${MODEL_OPUS}\``,
-      `• Fable 5.1: \`${MODEL_FABLE}\``,
+      `• Fable (latest): \`${MODEL_FABLE}\` (alias)`,
+      ...MODEL_FABLE_IDS.map((id) => `• Fable ${id.replace("claude-fable-", "").replace("-", ".")}: \`${id}\``),
       `• Config default: \`${settings.model || "(unset)"}\``,
       "",
       "Use /modelid <id> to switch to any of these (or another valid model ID) for this topic.",
@@ -1530,7 +1534,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   if (command === "/modelfable") {
     chatModels.set(modelKey(chatId, threadId), MODEL_FABLE);
     persistTelegramState();
-    await sendMessage(config.token, chatId, "📖 Switched to Fable 5.1. (this topic only)", threadId);
+    await sendMessage(config.token, chatId, "📖 Switched to Fable (latest). (this topic only)", threadId);
     return;
   }
 
@@ -2140,7 +2144,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "modelhaiku", description: "⚡ Switch to Haiku (fastest)" },
       { command: "modelsonnet", description: "⚖️ Switch to Sonnet (balanced)" },
       { command: "modelopus", description: "🧠 Switch to Opus (most capable)" },
-      { command: "modelfable", description: "📖 Switch to Fable 5.1" },
+      { command: "modelfable", description: "📖 Switch to latest Fable" },
       { command: "modelid", description: "📊 Switch to any model ID" },
       { command: "modelids", description: "📋 List known model IDs" },
       { command: "modeldefault", description: "🔄 Reset to config default model" },
