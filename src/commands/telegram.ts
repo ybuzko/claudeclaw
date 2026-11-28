@@ -649,11 +649,12 @@ function persistTelegramState(): void {
 }
 
 loadTelegramState();
-const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const MODEL_SONNET = "claude-sonnet-4-6";
-const MODEL_OPUS = "claude-opus-4-7";
-// "fable" is a Claude Code alias that resolves to the newest Fable release, so
-// /modelfable tracks new versions without a code change. Pinned IDs: /modelids.
+// Claude Code aliases: each resolves to the newest release of its family, so the
+// /model* commands track new versions without a code change. Pinned IDs: /modelids.
+const MODEL_HAIKU = "haiku";
+const MODEL_SONNET = "sonnet";
+const MODEL_OPUS = "opus";
+const MODEL_PINNED_IDS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
 const MODEL_FABLE = "fable";
 const MODEL_FABLE_IDS = ["claude-fable-5-2", "claude-fable-5-1"];
 
@@ -1487,7 +1488,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     if (!currentModel) {
       await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)${optionsList}`, threadId);
     } else {
-      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel === MODEL_FABLE ? "Fable (latest)" : currentModel;
+      const modelName = currentModel === MODEL_HAIKU ? "Haiku (latest)" : currentModel === MODEL_SONNET ? "Sonnet (latest)" : currentModel === MODEL_OPUS ? "Opus (latest)" : currentModel === MODEL_FABLE ? "Fable (latest)" : currentModel;
       await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**${optionsList}`, threadId);
     }
     return;
@@ -1497,12 +1498,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const settings = getSettings();
     const lines = [
       "📋 Model IDs:",
+      "Aliases (always the latest release):",
       `• Haiku: \`${MODEL_HAIKU}\``,
       `• Sonnet: \`${MODEL_SONNET}\``,
       `• Opus: \`${MODEL_OPUS}\``,
-      `• Fable (latest): \`${MODEL_FABLE}\` (alias)`,
-      ...MODEL_FABLE_IDS.map((id) => `• Fable ${id.replace("claude-fable-", "").replace("-", ".")}: \`${id}\``),
-      `• Config default: \`${settings.model || "(unset)"}\``,
+      `• Fable: \`${MODEL_FABLE}\``,
+      "",
+      "Pinned IDs:",
+      ...[...MODEL_PINNED_IDS, ...MODEL_FABLE_IDS].map((id) => `• \`${id}\``),
+      "",
+      `Config default: \`${settings.model || "(unset)"}\``,
       "",
       "Use /modelid <id> to switch to any of these (or another valid model ID) for this topic.",
     ];
